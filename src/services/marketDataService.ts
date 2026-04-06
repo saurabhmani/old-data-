@@ -1,0 +1,453 @@
+/**
+ * Market Data Service
+ *
+ * Source hierarchy (no external broker dependency):
+ *   Layer 1: Redis cache           (hot path, sub-millisecond)
+ *   Layer 2: NSE public API        (primary live source)
+ *   Layer 3: MySQL candle warehouse (historical fallback)
+ *   Layer 4: Yahoo Finance          (last-resort OHLCV)
+ *
+ * Every MarketSnapshot carries a data_quality score (0–1):
+ *   1.0  — fresh NSE live quote
+ *   0.75 — NSE quote from cache < 2 min old
+ *   0.50 — MySQL candle (may be yesterday's close)
+ *   0.25 — Yahoo Finance (delayed 15 min)
+ *   0.10 — stale cache > 15 min
+ *
+ * The quality score flows into the signal engine's risk gate:
+ *   quality < 0.40 → signal BLOCKED
+ *
+ * Also provides:
+ *   - True 52-week high/low from NSE (not intraday proxy)
+ *   - Historical candles from MySQL
+ *   - Scenario inputs: breadth ratio, sector trend, ATR
+ */
+
+import { db }                          from '@/lib/db';
+import { cacheGet, cacheSet }          from '@/lib/redis';
+import {
+  fetchNseQuote,
+  fetchNseOptionChain,
+  type NseQuote,
+}                                      from './nse';
+
+// ── Types ──────────────────────────────────────────────────────────
+
+export interface MarketSnapshot {
+  symbol:         string;
+  instrument_key: string;
+  ltp:            number;
+  open:           number;
+  high:           number;          // intraday high
+  low:            number;          // intraday low
+  close:          number;          // previous session close
+  volume:         number;
+  oi:             number;
+  change_percent: number;
+  change_abs:     number;
+  vwap:           number | null;
+  week52_high:    number;          // true 52W from NSE — NOT intraday
+  week52_low:     number;          // true 52W from NSE — NOT intraday
+  atr14:          number | null;   // 14-period ATR if candles available
+  delivery_pct:   number | null;   // from NSE priceInfo
+  timestamp:      number;          // Unix ms
+  source:         'nse' | 'cache' | 'db' | 'yahoo';
+  data_quality:   number;          // 0–1 quality score
+}
+
+export interface OptionChainSnapshot {
+  symbol:           string;
+  underlying_value: number;
+  expiry_dates:     string[];
+  records:          Array<{
+    strike_price:   number;
+    expiry_date:    string;
+    ce_oi:          number;
+    ce_change_oi:   number;
+    ce_iv:          number;
+    ce_ltp:         number;
+    ce_volume:      number;
+    pe_oi:          number;
+    pe_change_oi:   number;
+    pe_iv:          number;
+    pe_ltp:         number;
+    pe_volume:      number;
+  }>;
+  timestamp: number;
+}
+
+// ── Redis keys ─────────────────────────────────────────────────────
+const stockKey  = (s: string)  => `stock:${s.toUpperCase()}`;
+const optionKey = (s: string)  => `options:${s.toUpperCase()}`;
+const STOCK_TTL   = 60;
+const OPTIONS_TTL = 30;
+
+// ── Helpers ────────────────────────────────────────────────────────
+
+function n(v: unknown, fb = 0): number {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : fb;
+}
+
+function qualityFromAge(ageMs: number): number {
+  if (ageMs < 120_000)  return 0.75;   // < 2 min
+  if (ageMs < 600_000)  return 0.60;   // < 10 min
+  if (ageMs < 900_000)  return 0.40;   // < 15 min
+  return 0.10;                          // stale
+}
+
+// ── Layer 2: NSE ──────────────────────────────────────────────────
+
+function normaliseNseQuote(q: NseQuote, instrumentKey = ''): MarketSnapshot {
+  return {
+    symbol:         q.symbol,
+    instrument_key: instrumentKey || `NSE_EQ|${q.symbol}`,
+    ltp:            n(q.lastPrice),
+    open:           n(q.open),
+    high:           n(q.dayHigh),
+    low:            n(q.dayLow),
+    close:          n(q.previousClose),
+    volume:         n(q.totalTradedVolume),
+    oi:             0,
+    change_percent: n(q.pChange),
+    change_abs:     n(q.change),
+    vwap:           q.vwap != null ? n(q.vwap) : null,
+    // TRUE 52W from NSE weekHighLow — no longer using intraday high/low as proxy
+    week52_high:    n(q.fiftyTwoWeekHigh),
+    week52_low:     n(q.fiftyTwoWeekLow),
+    atr14:          null,  // computed separately from candles
+    delivery_pct:   q.deliveryToTradedQuantity != null
+                      ? n(q.deliveryToTradedQuantity) : null,
+    timestamp:      Date.now(),
+    source:         'nse',
+    data_quality:   1.0,
+  };
+}
+
+async function fetchFromNse(
+  symbol: string,
+  instrumentKey: string
+): Promise<MarketSnapshot | null> {
+  try {
+    const q = await fetchNseQuote(symbol);
+    if (!q?.lastPrice) return null;
+    return normaliseNseQuote(q, instrumentKey);
+  } catch {
+    return null;
+  }
+}
+
+// ── Layer 3: MySQL candle warehouse ───────────────────────────────
+
+export async function persistCandle(
+  instrumentKey: string,
+  candleType:    'intraday' | 'eod',
+  intervalUnit:  string,
+  ts:            Date,
+  open:          number,
+  high:          number,
+  low:           number,
+  close:         number,
+  volume:        number,
+  oi:            number = 0
+): Promise<void> {
+  await db.query(`
+    INSERT INTO candles
+      (instrument_key, candle_type, interval_unit, ts, open, high, low, close, volume, oi)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      open=VALUES(open), high=VALUES(high), low=VALUES(low),
+      close=VALUES(close), volume=VALUES(volume), oi=VALUES(oi)
+  `, [instrumentKey, candleType, intervalUnit, ts, open, high, low, close, volume, oi]);
+}
+
+export async function getLatestCandleFromDb(
+  instrumentKey: string,
+  intervalUnit  = '1day'
+): Promise<MarketSnapshot | null> {
+  try {
+    const { rows } = await db.query(`
+      SELECT instrument_key, open, high, low, close, volume, oi, ts
+      FROM candles
+      WHERE instrument_key=? AND interval_unit=?
+      ORDER BY ts DESC LIMIT 1
+    `, [instrumentKey, intervalUnit]);
+
+    if (!rows.length) return null;
+    const r   = rows[0] as any;
+    const sym = instrumentKey.split('|')[1] ?? instrumentKey;
+
+    return {
+      symbol:         sym.toUpperCase(),
+      instrument_key: instrumentKey,
+      ltp:            n(r.close),
+      open:           n(r.open),
+      high:           n(r.high),
+      low:            n(r.low),
+      close:          n(r.close),
+      volume:         n(r.volume),
+      oi:             n(r.oi),
+      change_percent: 0,
+      change_abs:     0,
+      vwap:           null,
+      week52_high:    0,
+      week52_low:     0,
+      atr14:          null,
+      delivery_pct:   null,
+      timestamp:      new Date(r.ts).getTime(),
+      source:         'db',
+      data_quality:   0.50,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ── Layer 4: Yahoo Finance ─────────────────────────────────────────
+
+async function fetchFromYahoo(symbol: string, instrumentKey: string): Promise<MarketSnapshot | null> {
+  try {
+    const yahooSym = symbol.endsWith('.NS') ? symbol : `${symbol}.NS`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=1d`;
+    const res  = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+
+    const json   = await res.json();
+    const result = json?.chart?.result?.[0];
+    if (!result) return null;
+
+    const meta   = result.meta ?? {};
+    const quote  = result.indicators?.quote?.[0] ?? {};
+    const idx    = (result.timestamp?.length ?? 0) - 1;
+
+    const ltp    = n(meta.regularMarketPrice || meta.previousClose);
+    if (!ltp) return null;
+
+    return {
+      symbol:         symbol.toUpperCase(),
+      instrument_key: instrumentKey || `NSE_EQ|${symbol}`,
+      ltp,
+      open:           n(quote.open?.[idx]   ?? meta.chartPreviousClose),
+      high:           n(quote.high?.[idx]   ?? ltp),
+      low:            n(quote.low?.[idx]    ?? ltp),
+      close:          n(meta.chartPreviousClose ?? ltp),
+      volume:         n(quote.volume?.[idx] ?? 0),
+      oi:             0,
+      change_percent: n(meta.regularMarketChangePercent),
+      change_abs:     n(meta.regularMarketChange),
+      vwap:           null,
+      week52_high:    n(meta.fiftyTwoWeekHigh),
+      week52_low:     n(meta.fiftyTwoWeekLow),
+      atr14:          null,
+      delivery_pct:   null,
+      timestamp:      Date.now(),
+      source:         'yahoo',
+      data_quality:   0.25,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ── ATR computation from MySQL candles ────────────────────────────
+
+export async function computeAtr14(instrumentKey: string): Promise<number | null> {
+  try {
+    const { rows } = await db.query(`
+      SELECT high, low, close
+      FROM candles
+      WHERE instrument_key=? AND interval_unit='1day'
+      ORDER BY ts DESC LIMIT 15
+    `, [instrumentKey]);
+
+    if (rows.length < 2) return null;
+
+    const candles = (rows as any[]).reverse();
+    const trs: number[] = [];
+
+    for (let i = 1; i < candles.length; i++) {
+      const h  = n(candles[i].high);
+      const l  = n(candles[i].low);
+      const pc = n(candles[i-1].close);
+      trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+    }
+
+    const atr = trs.slice(-14).reduce((a, b) => a + b, 0) / Math.min(14, trs.length);
+    return parseFloat(atr.toFixed(2));
+  } catch {
+    return null;
+  }
+}
+
+// ── Redis cache helpers ────────────────────────────────────────────
+
+async function readFromCache(symbol: string): Promise<MarketSnapshot | null> {
+  try {
+    const snap = await cacheGet<MarketSnapshot>(stockKey(symbol));
+    if (!snap) return null;
+    const ageMs  = Date.now() - snap.timestamp;
+    const quality = qualityFromAge(ageMs);
+    return { ...snap, source: 'cache', data_quality: quality };
+  } catch {
+    return null;
+  }
+}
+
+async function writeToCache(snap: MarketSnapshot): Promise<void> {
+  try {
+    await cacheSet(stockKey(snap.symbol), snap, STOCK_TTL);
+  } catch {}
+}
+
+// ── Main public API ───────────────────────────────────────────────
+
+/**
+ * getMarketSnapshot
+ *
+ * Returns a MarketSnapshot using the 4-layer hierarchy:
+ *   Redis → NSE → MySQL → Yahoo
+ *
+ * Called by the background scheduler (not per user request).
+ * Writes back to Redis on successful live fetch.
+ */
+export async function getMarketSnapshot(
+  symbol:        string,
+  instrumentKey: string
+): Promise<MarketSnapshot | null> {
+  const sym = symbol.toUpperCase();
+
+  // Layer 1: Redis
+  const cached = await readFromCache(sym);
+  if (cached && cached.data_quality >= 0.40) return cached;
+
+  // Layer 2: NSE
+  let snap = await fetchFromNse(sym, instrumentKey);
+
+  // Layer 3: MySQL candle (if NSE is unavailable)
+  if (!snap) {
+    snap = await getLatestCandleFromDb(instrumentKey);
+  }
+
+  // Layer 4: Yahoo Finance (last resort)
+  if (!snap) {
+    snap = await fetchFromYahoo(sym, instrumentKey);
+  }
+
+  if (!snap) return cached ?? null; // return stale cache if all layers fail
+
+  // Enrich with ATR if fresh
+  if (snap.source === 'nse' || snap.source === 'yahoo') {
+    snap.atr14 = await computeAtr14(instrumentKey);
+  }
+
+  // Write to Redis
+  await writeToCache(snap);
+
+  // Persist to MySQL candles (non-blocking)
+  if (snap.ltp > 0) {
+    persistCandle(
+      instrumentKey || `NSE_EQ|${sym}`,
+      'intraday', '1minute',
+      new Date(snap.timestamp),
+      snap.open, snap.high, snap.low, snap.ltp,
+      snap.volume, snap.oi
+    ).catch(() => {});
+  }
+
+  return snap;
+}
+
+// ── Batch snapshots ───────────────────────────────────────────────
+
+export async function getBatchSnapshots(
+  items: Array<{ symbol: string; instrument_key: string }>
+): Promise<Record<string, MarketSnapshot>> {
+  const results: Record<string, MarketSnapshot> = {};
+  const BATCH = 5;
+
+  for (let i = 0; i < items.length; i += BATCH) {
+    const chunk = items.slice(i, i + BATCH);
+    await Promise.all(chunk.map(async ({ symbol, instrument_key }) => {
+      const snap = await getMarketSnapshot(symbol, instrument_key);
+      if (snap) results[symbol.toUpperCase()] = snap;
+    }));
+    if (i + BATCH < items.length) {
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+  return results;
+}
+
+// ── Option chain ──────────────────────────────────────────────────
+
+export async function getOptionChainSnapshot(
+  symbol: string
+): Promise<OptionChainSnapshot | null> {
+  const sym = symbol.toUpperCase();
+
+  const cached = await cacheGet<OptionChainSnapshot>(optionKey(sym));
+  if (cached) return cached;
+
+  try {
+    const chain = await fetchNseOptionChain(sym);
+    if (!chain) return null;
+
+    const snap: OptionChainSnapshot = {
+      symbol:           sym,
+      underlying_value: chain.underlyingValue,
+      expiry_dates:     chain.expiryDates,
+      records:          chain.records.map(row => ({
+        strike_price:  row.strikePrice,
+        expiry_date:   row.expiryDate,
+        ce_oi:         row.CE?.openInterest         ?? 0,
+        ce_change_oi:  row.CE?.changeinOpenInterest ?? 0,
+        ce_iv:         row.CE?.impliedVolatility    ?? 0,
+        ce_ltp:        row.CE?.lastPrice            ?? 0,
+        ce_volume:     row.CE?.totalTradedVolume    ?? 0,
+        pe_oi:         row.PE?.openInterest         ?? 0,
+        pe_change_oi:  row.PE?.changeinOpenInterest ?? 0,
+        pe_iv:         row.PE?.impliedVolatility    ?? 0,
+        pe_ltp:        row.PE?.lastPrice            ?? 0,
+        pe_volume:     row.PE?.totalTradedVolume    ?? 0,
+      })),
+      timestamp: Date.now(),
+    };
+
+    await cacheSet(optionKey(sym), snap, OPTIONS_TTL);
+    return snap;
+  } catch {
+    return null;
+  }
+}
+
+// ── Historical candles ────────────────────────────────────────────
+
+export async function getHistoricalCandles(
+  instrumentKey: string,
+  intervalUnit   = '1day',
+  limit          = 200
+): Promise<Array<{
+  ts: string; open: number; high: number;
+  low: number; close: number; volume: number; oi: number;
+}>> {
+  try {
+    const { rows } = await db.query(`
+      SELECT ts, open, high, low, close, volume, oi
+      FROM candles
+      WHERE instrument_key=? AND interval_unit=?
+      ORDER BY ts DESC LIMIT ?
+    `, [instrumentKey, intervalUnit, limit]);
+
+    return (rows as any[]).map(r => ({
+      ts:     r.ts instanceof Date ? r.ts.toISOString() : String(r.ts),
+      open:   n(r.open),
+      high:   n(r.high),
+      low:    n(r.low),
+      close:  n(r.close),
+      volume: n(r.volume),
+      oi:     n(r.oi),
+    })).reverse();
+  } catch {
+    return [];
+  }
+}

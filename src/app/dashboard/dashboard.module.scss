@@ -1,0 +1,108 @@
+@use '@/styles/variables' as *;
+@use '@/styles/mixins'    as *;
+
+// ── Spin ──────────────────────────────────────────────────────────
+.spin { animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+// ── Section ───────────────────────────────────────────────────────
+.section {
+  margin-bottom: $s8;
+  &:last-child { margin-bottom: 0; }
+}
+
+// ── Section heading ───────────────────────────────────────────────
+.sectionHead {
+  @include flex-start;
+  gap:           $s2;
+  margin-bottom: $s4;
+  padding-bottom: $s3;
+  // Updated: cyan underline instead of grey border
+  border-bottom: 2px solid $color-glow-light;
+
+  span {
+    font-size:   $text-md;
+    font-weight: 700;
+    // Updated: gradient text on section headers
+    @include gradient-text;
+  }
+
+  svg { color: $color-glow-dark; flex-shrink: 0; }
+}
+
+// ── 4-box intel row ───────────────────────────────────────────────
+.intelRow {
+  display: grid;
+  gap:     $s4;
+  grid-template-columns: 1fr;
+  margin-bottom: $s4;
+
+  @include md { grid-template-columns: repeat(2, 1fr); }
+  @include xl { grid-template-columns: repeat(4, 1fr); }
+}
+
+// ── Intel box ─────────────────────────────────────────────────────
+.intelBox {
+  @include card;
+  padding:    $s4;
+  min-height: 94px;
+  transition: box-shadow $t-fast, border-color $t-fast;
+
+  &:hover {
+    box-shadow:   $shadow-glow;
+    border-color: $color-glow-mid;
+  }
+}
+
+// ── Box label ─────────────────────────────────────────────────────
+.boxLabel {
+  font-size:      $text-xs;
+  font-weight:    700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color:          $color-glow-dark;   // cyan instead of grey for labels
+}
+
+// ── Sector grid ───────────────────────────────────────────────────
+.sectorGrid {
+  display: grid;
+  gap:     $s3;
+  grid-template-columns: repeat(2, 1fr);
+  margin-bottom: $s4;
+
+  @include md { grid-template-columns: repeat(4, 1fr); }
+  @include xl { grid-template-columns: repeat(8, 1fr); }
+}
+
+.sectorChip {
+  border:        1px solid $color-border;
+  border-radius: $r-md;
+  padding:       $s3;
+  display:       flex;
+  flex-direction: column;
+  gap:           $s1;
+  transition:    all $t-fast;
+
+  &:hover {
+    box-shadow:   $shadow-sm;
+    border-color: $color-glow-mid;
+    transform:    translateY(-1px);
+  }
+}
+
+// ── Opportunity card ──────────────────────────────────────────────
+.oppCard {
+  background:    $color-surface;
+  border:        1px solid $color-border;
+  border-left:   3px solid $color-primary-mid;
+  border-radius: $r-lg;
+  padding:       $s5;
+  box-shadow:    $shadow-sm;
+  transition:    all $t-fast;
+
+  &:hover {
+    box-shadow:   $shadow-glow;
+    border-color: $color-glow-mid;
+    transform:    translateY(-2px);
+  }
+}
