@@ -268,7 +268,7 @@ function normaliseFiiDii(raw: any[]): FiiDiiEntry[] {
     const cat  = String(row.category ?? row.clientType ?? '').toLowerCase();
     const buy  = toNum(row.buyValue  ?? row.buy  ?? row.purchaseValue  ?? row.grossPurchase ?? 0);
     const sell = toNum(row.sellValue ?? row.sell ?? row.salesValue     ?? row.grossSales    ?? 0);
-    const net  = toNum(row.netValue  ?? row.net  ?? row.netPurchase    ?? (buy - sell));
+    const net  = row.netValue != null ? toNum(row.netValue) : row.net != null ? toNum(row.net) : row.netPurchase != null ? toNum(row.netPurchase) : (buy - sell);
 
     if (cat.includes('fii') || cat.includes('fpi') || cat.includes('foreign')) {
       byDate[date].fii_buy  = buy;

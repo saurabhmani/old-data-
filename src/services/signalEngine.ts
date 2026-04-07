@@ -21,7 +21,7 @@ import { db }                         from '@/lib/db';
 import { cacheGet, cacheSet }         from '@/lib/redis';
 import { getSnapshotSync }            from './dataAggregator';
 import { fetchNseQuote }              from './nse';
-import { computeAtr14 }              from './marketDataService';
+import { computeAtr14, getMarketSnapshot } from './marketDataService';
 import { getConfig, applyStanceOverrides } from './systemConfigService';
 import type { MarketSnapshot }        from './marketDataService';
 import { computeScenario }            from './scenarioEngine';
@@ -410,22 +410,11 @@ export async function generateSignal(
   const cached   = await cacheGet<Signal>(cacheKey);
   if (cached) return cached;
 
-  // ── Step 1: Market data ────────────────────────────────────────
+  // ── Step 1: Market data (Redis → NSE → MySQL → Yahoo) ──────────
   const snap = await getSnapshotSync(tradingsymbol, instrumentKey)
-    ?? await fetchNseQuote(tradingsymbol).then(q => {
-      if (!q?.lastPrice) return null;
-      return {
-        symbol: tradingsymbol, instrument_key: instrumentKey,
-        ltp: q.lastPrice, open: q.open, high: q.dayHigh, low: q.dayLow,
-        close: q.previousClose, volume: q.totalTradedVolume, oi: 0,
-        change_percent: q.pChange, change_abs: q.change, vwap: q.vwap??null,
-        week52_high: q.fiftyTwoWeekHigh, week52_low: q.fiftyTwoWeekLow,
-        atr14: null, delivery_pct: q.deliveryToTradedQuantity??null,
-        timestamp: Date.now(), source: 'nse' as const, data_quality: 1.0,
-      };
-    }).catch(() => null);
+    ?? await getMarketSnapshot(tradingsymbol, instrumentKey);
 
-  if (!snap) return null;
+  if (!snap || snap.ltp <= 0) return null;
 
   // ── Step 2: Features ───────────────────────────────────────────
   const features = await buildFeatures(snap);
@@ -614,10 +603,15 @@ export async function generateSignal(
 export async function generateSignalsForWatchlist(
   items: Array<{instrument_key: string; tradingsymbol: string; exchange: string}>
 ): Promise<Signal[]> {
+  // Process in concurrent batches of 5 to be faster while not hammering NSE
+  const BATCH = 5;
   const results: Signal[] = [];
-  for (const item of items) {
-    const sig = await generateSignal(item.instrument_key, item.tradingsymbol, item.exchange);
-    if (sig) results.push(sig);
+  for (let i = 0; i < items.length; i += BATCH) {
+    const chunk = items.slice(i, i + BATCH);
+    const sigs = await Promise.all(
+      chunk.map(item => generateSignal(item.instrument_key, item.tradingsymbol, item.exchange).catch(() => null))
+    );
+    for (const sig of sigs) { if (sig) results.push(sig); }
   }
   return results
     .filter(s => s.rejection_reasons.length === 0)

@@ -2,12 +2,25 @@
  * Data Sync Service — Quantorus365
  *
  * 1. syncRankingsFromNse    — NSE live movers → rankings table
+ *                             Falls back to NIFTY 50 + Yahoo Finance when NSE is blocked
  * 2. syncInstrumentsFromCdn — public CDN instrument master (no auth)
  *
  * No broker OAuth. All sources are public or internal DB.
  */
 import { db } from '@/lib/db';
 import { fetchGainersLosers, fetchInstrumentsJson } from '@/services/nse';
+import { getMarketSnapshot } from './marketDataService';
+
+// ── NIFTY 50 fallback universe ────────────────────────────────────
+const NIFTY50 = [
+  'RELIANCE','TCS','HDFCBANK','INFY','ICICIBANK','HINDUNILVR','ITC','SBIN',
+  'BHARTIARTL','KOTAKBANK','BAJFINANCE','LT','AXISBANK','ASIANPAINT','MARUTI',
+  'NESTLEIND','HCLTECH','WIPRO','ULTRACEMCO','POWERGRID','NTPC','ONGC',
+  'SUNPHARMA','TITAN','ADANIENT','ADANIPORTS','BAJAJFINSV','BPCL','BRITANNIA',
+  'CIPLA','COALINDIA','DIVISLAB','DRREDDY','EICHERMOT','GRASIM','HEROMOTOCO',
+  'HINDALCO','INDUSINDBK','JSWSTEEL','LTIM','M&M','ONGC','SBILIFE',
+  'SHRIRAMFIN','TATACONSUM','TATAMOTORS','TATASTEEL','TECHM','VEDL','ZOMATO',
+];
 
 function pickSymbol(g: Record<string, unknown>): string {
   const raw = g.symbol ?? g.sym ?? g.tradingSymbol ??
@@ -29,9 +42,40 @@ function pickName(g: Record<string, unknown>, sym: string): string {
   return String(g.symbolName ?? g.companyName ?? g.name ?? g.symbol ?? sym);
 }
 
+async function seedRankingsFromYahoo(): Promise<{ inserted: number; message: string }> {
+  console.log('[DataSync] NSE unavailable — seeding rankings from NIFTY 50 + Yahoo Finance');
+  try { await db.query(`DELETE FROM rankings`); } catch { /* ignore */ }
+
+  let inserted = 0;
+  let pos = 0;
+  const BATCH = 5;
+  for (let i = 0; i < NIFTY50.length; i += BATCH) {
+    const chunk = NIFTY50.slice(i, i + BATCH);
+    await Promise.all(chunk.map(async sym => {
+      const key  = `NSE_EQ|${sym}`;
+      const snap = await getMarketSnapshot(sym, key);
+      const ltp  = snap?.ltp ?? 0;
+      const pct  = snap?.change_percent ?? 0;
+      const vol  = snap?.volume ?? 0;
+      const score = Math.min(100, Math.max(0, 50 + pct * 2));
+      pos++;
+      try {
+        await db.query(
+          `INSERT INTO rankings (instrument_key,tradingsymbol,name,exchange,score,rank_position,pct_change,ltp,volume)
+           VALUES (?,?,?,?,?,?,?,?,?)
+           ON DUPLICATE KEY UPDATE score=VALUES(score),ltp=VALUES(ltp),pct_change=VALUES(pct_change),volume=VALUES(volume)`,
+          [key, sym, sym, 'NSE', score, pos, pct, ltp, vol]
+        );
+        inserted++;
+      } catch { /* skip */ }
+    }));
+  }
+  return { inserted, message: `Rankings seeded from Yahoo Finance: ${inserted} NIFTY 50 symbols.` };
+}
+
 export async function syncRankingsFromNse(): Promise<{ inserted: number; message: string }> {
   const gainers = await fetchGainersLosers('gainers');
-  if (!gainers.length) return { inserted: 0, message: 'No live data from NSE. Try 09:15–15:30 IST weekdays.' };
+  if (!gainers.length) return seedRankingsFromYahoo();
 
   const slice = gainers.slice(0, 60).map(g => g as Record<string, unknown>);
   const keyMap = new Map<string, string>();

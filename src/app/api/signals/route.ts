@@ -27,6 +27,7 @@ import {
 }                                     from '@/services/signalEngine';
 import { getRejectionAnalysis }       from '@/services/performanceTracker';
 import { fetchGainersLosers }         from '@/services/nse';
+import { cacheSet }                   from '@/lib/redis';
 
 export const dynamic   = 'force-dynamic';
 export const revalidate = 0;
@@ -37,20 +38,26 @@ export async function GET(req: NextRequest) {
 
   const { searchParams } = req.nextUrl;
   const action   = searchParams.get('action') || 'top';
-  const symParam = searchParams.get('symbol');
-  const keyParam = searchParams.get('key');
+  const symParam = searchParams.get('symbol')?.trim().replace(/\s+/g, '') || null;
+  const keyParam = searchParams.get('key')?.trim().replace(/\s+/g, '') || null;
   const limit    = Math.min(parseInt(searchParams.get('limit') || '20'), 100);
 
   // ── Single instrument signal ────────────────────────────────
   if (action === 'instrument' && (symParam || keyParam)) {
     const identifier = symParam ?? keyParam!;
-    const { rows }   = await db.query(
+    const sym        = identifier.includes('|') ? identifier.split('|')[1].toUpperCase() : identifier.toUpperCase();
+    const ikey       = identifier.includes('|') ? identifier : `NSE_EQ|${sym}`;
+
+    // Try instruments table first, fall back to derived values
+    const dbResult = await db.query(
       `SELECT tradingsymbol, exchange, instrument_key FROM instruments
        WHERE tradingsymbol=? OR instrument_key=? LIMIT 1`,
-      [identifier, identifier]
-    );
-    const inst = rows[0] as any;
-    if (!inst) return NextResponse.json({ error: 'Instrument not found' }, { status: 404 });
+      [sym, ikey]
+    ).catch(() => ({ rows: [] }));
+    const inst = (dbResult.rows[0] as any) ?? {
+      tradingsymbol: sym, exchange: 'NSE', instrument_key: ikey,
+    };
+    if (!inst.tradingsymbol) return NextResponse.json({ error: 'Instrument not found' }, { status: 404 });
 
     const signal = await generateSignal(inst.instrument_key, inst.tradingsymbol, inst.exchange);
     if (!signal) {
@@ -103,13 +110,50 @@ export async function GET(req: NextRequest) {
       rows = r.rows || [];
     } catch {}
 
-    // Rankings table empty — fall back to NSE top gainers
+    // Rankings table empty — fall back to NSE top gainers + losers
     if (!rows.length) {
       try {
-        const gainers = await fetchGainersLosers('gainers');
-        rows = gainers.slice(0, limit * 4).map((g: any) => {
-          const meta = g.meta ?? g;
-          const sym  = String(meta.symbol ?? g.symbol ?? '').toUpperCase();
+        // Fetch gainers AND losers for a balanced signal universe
+        const [gainers, losers] = await Promise.all([
+          fetchGainersLosers('gainers'),
+          fetchGainersLosers('losers'),
+        ]);
+        const combined = [...gainers, ...losers];
+
+        // Pre-seed the in-process cache so generateSignal doesn't make
+        // another individual NSE call per symbol (avoids rate limiting).
+        await Promise.all(combined.map(async (g: any) => {
+          const sym = String(g.symbol ?? g.meta?.symbol ?? '').toUpperCase();
+          if (!sym) return;
+          const snap = {
+            symbol:         sym,
+            instrument_key: `NSE_EQ|${sym}`,
+            ltp:            Number(g.ltp ?? g.lastPrice ?? g.ltP ?? 0),
+            open:           Number(g.open ?? g.ltp ?? 0),
+            high:           Number(g.dayHigh ?? g.high ?? g.ltp ?? 0),
+            low:            Number(g.dayLow  ?? g.low  ?? g.ltp ?? 0),
+            close:          Number(g.previousClose ?? g.ltp ?? 0),
+            volume:         Number(g.tradedQuantity ?? g.totalTradedVolume ?? g.volume ?? 0),
+            oi:             0,
+            change_percent: Number(g.pChange ?? g.perChange ?? 0),
+            change_abs:     Number(g.netPrice ?? g.change ?? 0),
+            vwap:           null,
+            week52_high:    Number(g.yearHigh  ?? g.week52High ?? 0),
+            week52_low:     Number(g.yearLow   ?? g.week52Low  ?? 0),
+            atr14:          null,
+            delivery_pct:   null,
+            timestamp:      Date.now(),
+            source:         'nse' as const,
+            data_quality:   0.9,
+          };
+          // Write to in-process cache (key read by getSnapshotSync)
+          await cacheSet(`stock:${sym}`, snap, 120);
+        }));
+
+        // Cap at 3× limit so signal engine doesn't process 120 stocks
+        const cap = Math.min(limit * 3, 60);
+        rows = combined.slice(0, cap).map((g: any) => {
+          const sym = String(g.symbol ?? g.meta?.symbol ?? '').toUpperCase();
           return { instrument_key: `NSE_EQ|${sym}`, tradingsymbol: sym, exchange: 'NSE' };
         }).filter((r: any) => r.tradingsymbol);
       } catch { /* NSE unavailable */ }

@@ -15,7 +15,8 @@
     "scheduler": "ts-node -P tsconfig.node.json -r tsconfig-paths/register src/lib/workers/scheduler.ts",
     "scheduler:dev": "NODE_ENV=development ts-node -P tsconfig.node.json -r tsconfig-paths/register src/lib/workers/scheduler.ts",
     "db:migrate-q365": "ts-node -P tsconfig.node.json -r tsconfig-paths/register src/lib/db/migrateQ365.ts",
-    "db:seed-users": "ts-node -P tsconfig.node.json src/lib/db/seedUsers.ts"
+    "db:seed-users": "ts-node -P tsconfig.node.json src/lib/db/seedUsers.ts",
+    "db:setup": "ts-node -P tsconfig.node.json src/lib/db/setup.ts"
   },
   "dependencies": {
     "next": "14.2.5",

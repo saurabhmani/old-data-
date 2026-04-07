@@ -122,6 +122,7 @@
 .main {
   flex:1; margin-left:$sidebar-w; min-height:100vh;
   @include flex-col;
+  overflow-x: hidden;
   @include below-md { margin-left:0; }
 }
 
@@ -179,7 +180,7 @@
 
 // ── Page wrapper ──────────────────────────────────────────────────
 .page {
-  flex:1; padding:$s6;
+  flex:1; padding:$s6; max-width:1632px; width:100%;
   @include below-md { padding:$s4; }
 
   &__header {

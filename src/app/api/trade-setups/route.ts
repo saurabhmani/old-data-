@@ -5,9 +5,10 @@
  * Rejected candidates are logged to signal_rejections for analysis.
  */
 import { NextRequest, NextResponse }    from 'next/server';
-import { requireSession, requireAdmin } from '@/lib/session';
+import { requireSession } from '@/lib/session';
 import { db }                           from '@/lib/db';
 import { generateSignal, logRejection } from '@/services/signalEngine';
+import { syncRankingsFromNse }          from '@/services/dataSync';
 
 export const dynamic   = 'force-dynamic';
 export const revalidate = 0;
@@ -56,8 +57,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  try { await requireAdmin(); }
-  catch { return NextResponse.json({ error: 'Forbidden' }, { status: 403 }); }
+  try { await requireSession(); }
+  catch { return NextResponse.json({ error: 'Unauthorized' }, { status: 401 }); }
 
   const body  = await req.json().catch(() => ({}));
   const limit = parseInt(body.limit ?? '30');
@@ -69,7 +70,18 @@ export async function POST(req: NextRequest) {
       [Math.min(limit, 100)]
     );
     ranked = rows as any[];
-  } catch { return NextResponse.json({ error: 'Rankings not found' }, { status: 503 }); }
+  } catch { return NextResponse.json({ error: 'Rankings table not found — run migrations.' }, { status: 503 }); }
+
+  // Auto-seed rankings from NSE / Yahoo when empty
+  if (ranked.length === 0) {
+    console.log('[TradeSetups] Rankings empty — auto-syncing...');
+    await syncRankingsFromNse();
+    const { rows: r2 } = await db.query(
+      `SELECT instrument_key, tradingsymbol, exchange FROM rankings ORDER BY score DESC LIMIT ?`,
+      [Math.min(limit, 100)]
+    );
+    ranked = r2 as any[];
+  }
 
   let created = 0, rejected = 0, skipped = 0;
   const expiresAt = new Date(Date.now() + 24 * 3600 * 1000);
@@ -115,8 +127,9 @@ export async function POST(req: NextRequest) {
 
   return NextResponse.json({
     success: true, created, rejected, skipped, total: ranked.length,
-    approval_rate: ranked.length > 0
-      ? parseFloat((created/ranked.length*100).toFixed(1)) : 0,
-    note: `${rejected} signals blocked by rejection engine. See /api/admin?action=rejection_analysis`,
+    approval_rate: ranked.length > 0 ? parseFloat((created/ranked.length*100).toFixed(1)) : 0,
+    note: created > 0
+      ? `${created} setups created. ${rejected} signals blocked by rejection engine.`
+      : `No setups passed filters (${rejected} rejected, ${skipped} skipped from ${ranked.length} stocks). Market may be closed or data quality too low.`,
   });
 }

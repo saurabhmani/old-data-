@@ -11,6 +11,7 @@
 import { cacheGet, cacheSet }                    from '@/lib/redis';
 import { db }                                    from '@/lib/db';
 import { fetchNseIndices, fetchGainersLosers }   from './nse';
+import { syncRankingsFromNse }                   from './dataSync';
 
 export type SignalType = 'BUY' | 'SELL' | 'HOLD' | null;
 
@@ -288,7 +289,7 @@ export async function getRankings(opts: {
   const { rows, total } = await fetchFromMySQL(limit, offset, exchange);
   rows.sort((a, b) => b.opportunity_rank - a.opportunity_rank);
 
-  // MySQL is empty — auto-seed from NSE live data
+  // MySQL is empty — try NSE live data first, then seed via Yahoo Finance fallback
   if (rows.length === 0 && page === 1) {
     const nseRows = await buildFromNse(limit);
     if (nseRows.length > 0) {
@@ -298,6 +299,21 @@ export async function getRankings(opts: {
         page, limit, has_more: false,
         data_source: 'redis', as_of: new Date().toISOString(),
       };
+    }
+
+    // NSE also blocked — seed rankings table from NIFTY50 + Yahoo Finance, then re-query
+    console.log('[Rankings] NSE unavailable — seeding rankings via Yahoo Finance fallback');
+    await syncRankingsFromNse();
+    const { rows: seeded, total: seededTotal } = await fetchFromMySQL(limit, offset, exchange);
+    if (seeded.length > 0) {
+      seeded.sort((a, b) => b.opportunity_rank - a.opportunity_rank);
+      const seededResult: RankingsResult = {
+        data: seeded, count: seeded.length, total: seededTotal,
+        page, limit, has_more: false,
+        data_source: 'mysql', as_of: new Date().toISOString(),
+      };
+      await cacheSet(rankingsKey(limit, exchange), seededResult, RANKINGS_TTL);
+      return seededResult;
     }
   }
 

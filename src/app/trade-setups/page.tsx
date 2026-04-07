@@ -14,6 +14,7 @@ export default function TradeSetupsPage() {
   const [setups,   setSetups]   = useState<any[]>([]);
   const [loading,  setLoading]  = useState(true);
   const [recomp,   setRecomp]   = useState(false);
+  const [note,     setNote]     = useState<string | null>(null);
 
   async function load() {
     setLoading(true);
@@ -25,8 +26,13 @@ export default function TradeSetupsPage() {
 
   const recompute = async () => {
     setRecomp(true);
-    try { await fetch('/api/trade-setups', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' }); await load(); }
-    finally { setRecomp(false); }
+    setNote(null);
+    try {
+      const res  = await fetch('/api/trade-setups', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await res.json();
+      if (data.note) setNote(data.note);
+      await load();
+    } finally { setRecomp(false); }
   };
 
   return (
@@ -37,8 +43,14 @@ export default function TradeSetupsPage() {
           <Button variant="secondary" onClick={recompute} loading={recomp}><RefreshCw size={13} /> Recompute</Button>
         </div>
 
+        {note && (
+          <div style={{ background: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: 13, color: '#166534' }}>
+            {note}
+          </div>
+        )}
+
         {loading ? <Loading /> : setups.length === 0 ? (
-          <Empty icon={Target} title="No active setups" description="Click Recompute to generate setups from top ranked stocks." action={<Button onClick={recompute} loading={recomp}><RefreshCw size={13} /> Generate Setups</Button>} />
+          <Empty icon={Target} title="No active setups" description="Click Recompute to generate setups from top ranked stocks. First run seeds the NIFTY 50 universe automatically." action={<Button onClick={recompute} loading={recomp}><RefreshCw size={13} /> Generate Setups</Button>} />
         ) : (
           <div className="grid-3">
             {setups.map((s: any) => (

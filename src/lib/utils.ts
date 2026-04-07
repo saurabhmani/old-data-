@@ -18,7 +18,7 @@ export const fmt = {
   },
 
   volume(val?: number | null): string {
-    if (!val) return '—';
+    if (val == null || isNaN(val)) return '—';
     if (val >= 1e7)  return `${(val / 1e7).toFixed(2)}Cr`;
     if (val >= 1e5)  return `${(val / 1e5).toFixed(2)}L`;
     if (val >= 1000) return `${(val / 1000).toFixed(1)}K`;

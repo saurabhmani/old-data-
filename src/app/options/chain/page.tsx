@@ -20,12 +20,23 @@ export default function OptionChainPage() {
   const [expiry,  setExpiry]  = useState(0);
   const [intel,   setIntel]   = useState<any>(null);
   const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState<string | null>(null);
 
   const load = useCallback(async (sym = symbol, exp = expiry) => {
     setLoading(true);
+    setError(null);
     try {
-      const d = await fetch(`/api/options/intelligence?symbol=${encodeURIComponent(sym)}&expiry=${exp}`).then(r => r.json());
-      setIntel(d.intelligence || null);
+      const res = await fetch(`/api/options/intelligence?symbol=${encodeURIComponent(sym)}&expiry=${exp}`);
+      const d   = await res.json();
+      if (!res.ok || !d.intelligence) {
+        setError(d.error || 'NSE option chain unavailable. Market may be closed or NSE is unreachable.');
+        setIntel(null);
+      } else {
+        setIntel(d.intelligence);
+      }
+    } catch {
+      setError('Network error — could not reach the server.');
+      setIntel(null);
     } finally { setLoading(false); }
   }, [symbol, expiry]);
 
@@ -61,7 +72,9 @@ export default function OptionChainPage() {
           />
         </div>
 
-        {loading ? <Loading text="Fetching NSE option chain…" /> : !intel ? (
+        {loading ? <Loading text="Fetching NSE option chain…" /> : error ? (
+          <Empty icon={AlertTriangle} title="Option chain unavailable" description={error} action={<Button onClick={() => load()}>Retry {symbol}</Button>} />
+        ) : !intel ? (
           <Empty icon={Target} title="Select a symbol to analyse" description="Click Analyse to load option chain intelligence." action={<Button onClick={() => load()}>Analyse {symbol}</Button>} />
         ) : (
           <div style={{ display: 'grid', gap: 20 }}>
@@ -71,6 +84,11 @@ export default function OptionChainPage() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
                 <h3 style={{ fontWeight: 700, fontSize: 18 }}>{intel.symbol}</h3>
                 <Badge>{intel.expiryDate}</Badge>
+                {intel.dataSource === 'synthetic' && (
+                  <Badge variant="gray" style={{ fontSize: 10, background: '#FEF3C7', color: '#92400E' }}>
+                    Estimated (NSE unavailable)
+                  </Badge>
+                )}
                 <span style={{ marginLeft: 'auto', fontSize: 20, fontWeight: 800, color: '#1E3A5F' }}>
                   ₹{intel.underlyingValue?.toLocaleString('en-IN')}
                 </span>

@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireSession } from '@/lib/session';
 import { analyzeOptionChain } from '@/services/optionIntelligence';
 
+export const dynamic   = 'force-dynamic';
+export const revalidate = 0;
+
 export async function GET(req: NextRequest) {
   try { await requireSession(); }
   catch { return NextResponse.json({ error: 'Unauthorized' }, { status: 401 }); }

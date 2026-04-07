@@ -40,6 +40,6 @@ export async function GET(req: NextRequest) {
     expiry_dates:     chain.expiry_dates,
     records:          chain.records,
     timestamp:        chain.timestamp,
-    source:           'nse',
+    source:           chain.source ?? 'nse',
   });
 }

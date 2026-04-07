@@ -55,6 +55,7 @@ export interface OptionIntelligence {
   ivContext:        string;
   summary:          string;
   generatedAt:      string;
+  dataSource:       'nse' | 'synthetic' | 'unknown';
 }
 
 function classifyBuildup(oiChange: number, priceChange: number, optionType: 'CE' | 'PE'): BuildupSignal['buildupType'] {
@@ -206,8 +207,10 @@ export async function analyzeOptionChain(symbol: string, expiryIndex = 0): Promi
     trapZones, expectedMoveUp, expectedMoveDown,
     pcr, pcrLabel, maxPain, ivContext, summary,
     generatedAt: new Date().toISOString(),
+    dataSource:  (chain.source ?? 'nse') as 'nse' | 'synthetic' | 'unknown',
   };
 
-  await cacheSet(cacheKey, intel, 120); // 2 min cache
+  const cacheTtl = intel.dataSource === 'synthetic' ? 60 : 120; // synthetic: 1 min, live: 2 min
+  await cacheSet(cacheKey, intel, cacheTtl);
   return intel;
 }
