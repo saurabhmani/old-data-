@@ -74,7 +74,7 @@ export interface OptionChainSnapshot {
     pe_volume:      number;
   }>;
   timestamp: number;
-  source:    'nse' | 'synthetic' | 'unknown';
+  source:    'nse' | 'synthetic' | 'yahoo' | 'unknown';
 }
 
 // ── Redis keys ─────────────────────────────────────────────────────
@@ -438,7 +438,7 @@ export async function getOptionChainSnapshot(
         pe_volume:     row.PE?.totalTradedVolume    ?? 0,
       })),
       timestamp: Date.now(),
-      source:    (chain.source ?? 'nse') as 'nse' | 'yahoo' | 'unknown',
+      source:    (chain.source ?? 'nse') as 'nse' | 'synthetic' | 'yahoo' | 'unknown',
     };
 
     await cacheSet(optionKey(sym), snap, OPTIONS_TTL);
