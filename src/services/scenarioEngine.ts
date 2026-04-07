@@ -18,6 +18,7 @@
 
 import { cacheGet, cacheSet }           from '@/lib/redis';
 import { db }                            from '@/lib/db';
+import { fetchNseIndices }               from './nse';
 
 // ════════════════════════════════════════════════════════════════
 //  TYPES
@@ -85,72 +86,84 @@ interface ScenarioInputs {
 }
 
 async function gatherInputs(): Promise<ScenarioInputs> {
-  // Read from Redis caches written by scheduler
-  // Reads 5 keys to build robust multi-dimensional input
-  const [intel, regime, snapshots, nseIndices, optChainNifty] = await Promise.all([
+  // Read from Redis caches written by scheduler.
+  // NOTE: market:intelligence is written by computeMarketIntelligence().
+  // To avoid a race condition the caller must ensure intelligence is computed
+  // before scenario (see /api/market-intelligence route).
+  const [intel, regime, nseIndices, optChainNifty] = await Promise.all([
     cacheGet<any>('market:intelligence'),
     cacheGet<any>('market:regime'),
-    cacheGet<any>('market:breadth_summary'),
-    cacheGet<any>('nse:/allIndices'),           // raw NSE index array
-    cacheGet<any>('options:NIFTY'),             // NIFTY option chain for PCR
+    cacheGet<any>('nse:/allIndices'),   // raw NSE index array (key: nse:/allIndices)
+    cacheGet<any>('options:NIFTY'),     // NIFTY option chain for PCR
   ]);
 
-  // Multi-timeframe Nifty trend: compare current vs yesterday from DB
+  // ── Sector / index data ──────────────────────────────────────────
+  // Primary: Redis cache (key nse:/allIndices, written by nseGet in nse.ts).
+  // Fallback: fetch NSE indices directly — works even when Redis is disabled.
+  let indicesData: any[] = (nseIndices as any)?.data ?? [];
+
+  if (!indicesData.length) {
+    try {
+      const live = await fetchNseIndices();
+      indicesData = live.map(i => ({ index: i.name, name: i.name, percentChange: i.percentChange, variation: i.variation }));
+    } catch { /* NSE unavailable — all index changes stay 0 */ }
+  }
+
+  // Resolve key index percent-changes directly from indicesData.
+  // NOTE: the old code used intel?.trendScore (wrong — field is trend_score, snake_case)
+  // and intel?.index_changes (field does not exist in MarketIntelligenceResult).
+  // Use NSE indices as the authoritative source; fall back to intel.trend_score.
+  function idxPct(name: string): number {
+    const d = indicesData.find((d: any) => d.index === name || d.name === name);
+    return d ? Number(d.percentChange ?? d.variation ?? 0) : 0;
+  }
+
+  const niftyChg   = idxPct('NIFTY 50')        || (intel?.trend_score != null ? intel.trend_score / 20 : 0);
+  const bankChg    = idxPct('NIFTY BANK');
+  const midcapChg  = idxPct('NIFTY MIDCAP 100');
+
+  // Sector leadership dispersion: fraction of key sectors that are positive.
+  const SECTOR_NAMES = ['NIFTY BANK','NIFTY IT','NIFTY PHARMA','NIFTY AUTO','NIFTY FMCG','NIFTY METAL','NIFTY ENERGY','NIFTY REALTY'];
+  const sectorChanges = SECTOR_NAMES
+    .map(name => indicesData.find((d: any) => d.index === name || d.name === name))
+    .filter(Boolean)
+    .map((d: any) => Number(d.percentChange ?? d.variation ?? 0));
+  const leadingCount     = sectorChanges.filter(v => v > 0.3).length;
+  const leaderDispersion = sectorChanges.length > 0
+    ? leadingCount / sectorChanges.length
+    : 0.5;
+
+  // ── PCR from NIFTY option chain cache ──────────────────────────
+  let pcr: number | null = null;
+  if ((optChainNifty as any)?.records?.length) {
+    const recs     = (optChainNifty as any).records as any[];
+    const totalCe  = recs.reduce((s: number, r: any) => s + (r.ce_oi || 0), 0);
+    const totalPe  = recs.reduce((s: number, r: any) => s + (r.pe_oi || 0), 0);
+    if (totalCe > 0) pcr = parseFloat((totalPe / totalCe).toFixed(2));
+  }
+
+  // ── Multi-timeframe Nifty trend from DB candles ─────────────────
   let niftyChgMTF = 0;
   try {
     const { rows } = await db.query(
       `SELECT close FROM candles WHERE instrument_key='NSE_INDEX|NIFTY 50' AND interval_unit='1day' ORDER BY ts DESC LIMIT 5`
     );
     if ((rows as any[]).length >= 2) {
-      const closes = (rows as any[]).map((r:any) => Number(r.close));
-      niftyChgMTF = closes[0] > 0 ? ((closes[0] - closes[closes.length-1]) / closes[closes.length-1]) * 100 : 0;
+      const closes = (rows as any[]).map((r: any) => Number(r.close));
+      niftyChgMTF = closes[0] > 0 ? ((closes[0] - closes[closes.length - 1]) / closes[closes.length - 1]) * 100 : 0;
     }
   } catch {}
 
-  // Sector leadership dispersion: how many sectors are positive?
-  const indicesData: any[] = (nseIndices as any)?.data ?? [];
-  const SECTOR_NAMES = ['NIFTY BANK','NIFTY IT','NIFTY PHARMA','NIFTY AUTO','NIFTY FMCG','NIFTY METAL','NIFTY ENERGY','NIFTY REALTY'];
-  const sectorChanges = SECTOR_NAMES
-    .map(name => indicesData.find((d:any) => d.index===name || d.name===name))
-    .filter(Boolean)
-    .map((d:any) => Number(d.percentChange ?? d.variation ?? 0));
-  const leadingCount   = sectorChanges.filter(v => v > 0.3).length;
-  const laggingCount   = sectorChanges.filter(v => v < -0.3).length;
-  const leaderDispersion = sectorChanges.length > 0 
-    ? leadingCount / sectorChanges.length  // 0 = all down, 1 = all up
-    : 0.5;
-
-  // PCR from option chain
-  let pcrFromChain: number | null = null;
-  if ((optChainNifty as any)?.records?.length) {
-    const recs = (optChainNifty as any).records as any[];
-    const tce = recs.reduce((s:number,r:any)=>s+(r.ce_oi||0),0);
-    const tpe = recs.reduce((s:number,r:any)=>s+(r.pe_oi||0),0);
-    if (tce > 0) pcrFromChain = parseFloat((tpe/tce).toFixed(2));
-  }
-
-  const niftyChg    = intel?.index_changes?.NIFTY50 ?? (intel?.trendScore != null ? intel.trendScore / 20 : 0);
-  const bankChg     = intel?.index_changes?.BANKNIFTY  ?? 0;
-  const midcapChg   = intel?.index_changes?.MIDCAP100  ?? 0;
-  const vix         = intel?.volatility?.nifty_vix     ?? null;
-  const advancing   = intel?.advancing                 ?? snapshots?.advancing ?? 200;
-  const declining   = intel?.declining                 ?? snapshots?.declining ?? 200;
-  const fiiNet      = intel?.fii_dii?.[0]?.fii_net     ?? 0;
-  const avgRange    = intel?.volatility?.avg_range_pct ?? 2;
+  // ── Breadth and vol from intel cache (MarketIntelligenceResult — snake_case fields) ──
+  const vix       = intel?.volatility?.nifty_vix     ?? null;
+  const advancing = intel?.advancing                  ?? 200;
+  const declining = intel?.declining                  ?? 200;
+  const fiiNet    = intel?.fii_dii?.[0]?.fii_net      ?? 0;
+  const avgRange  = intel?.volatility?.avg_range_pct  ?? 2;
   const sectorsPos  = (intel?.sector_strength ?? []).filter((s: any) => s.change_percent > 0).length;
   const sectorsTotal= (intel?.sector_strength ?? []).length || 8;
 
-  // PCR from options cache
-  const optChain  = await cacheGet<any>('options:NIFTY');
-  let pcr: number | null = null;
-  if (optChain?.records?.length) {
-    const recs      = optChain.records as any[];
-    const totalCeOi = recs.reduce((s: number, r: any) => s + (r.ce_oi || 0), 0);
-    const totalPeOi = recs.reduce((s: number, r: any) => s + (r.pe_oi || 0), 0);
-    pcr = totalCeOi > 0 ? parseFloat((totalPeOi / totalCeOi).toFixed(2)) : null;
-  }
-
-  // Average confidence of recent top signals
+  // ── Average confidence of recent top signals ────────────────────
   let avgTopConf = 60;
   try {
     const { rows } = await db.query(`
@@ -172,10 +185,10 @@ async function gatherInputs(): Promise<ScenarioInputs> {
     advancing,
     declining,
     fii_net_crore:      fiiNet,
-    pcr:                pcrFromChain ?? pcr,
+    pcr,
     avg_range_pct:      avgRange,
     sectors_positive:   sectorChanges.filter(v => v > 0).length,
-    sectors_total:      sectorChanges.length || 8,
+    sectors_total:      sectorsTotal,
     leader_dispersion:  leaderDispersion,
     avg_top_confidence: avgTopConf,
     regime:             regime?.regime ?? 'NEUTRAL',
@@ -325,9 +338,17 @@ const SCENARIO_STANCE: Record<ScenarioTag, string> = {
 const CACHE_KEY = 'scenario:current';
 const CACHE_TTL = 300; // 5 min
 
+// In-process memory cache — keeps scenario available when Redis is disabled
+let _scenarioMem: ScenarioResult | null = null;
+let _scenarioMemAt = 0;
+const SCENARIO_MEM_TTL_MS = 300_000; // 5 min
+
 export async function computeScenario(): Promise<ScenarioResult> {
+  // 1. In-process memory (survives Redis being disabled)
+  if (_scenarioMem && Date.now() - _scenarioMemAt < SCENARIO_MEM_TTL_MS) return _scenarioMem;
+  // 2. Redis cache
   const cached = await cacheGet<ScenarioResult>(CACHE_KEY);
-  if (cached) return cached;
+  if (cached) { _scenarioMem = cached; _scenarioMemAt = Date.now(); return cached; }
 
   const rawInputs   = await gatherInputs();
   const inputs      = enrichInputs(rawInputs);
@@ -377,6 +398,8 @@ export async function computeScenario(): Promise<ScenarioResult> {
   };
 
   await cacheSet(CACHE_KEY, result, CACHE_TTL);
+  _scenarioMem   = result;
+  _scenarioMemAt = Date.now();
 
   // Persist to DB (non-blocking)
   db.query(`

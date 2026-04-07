@@ -29,6 +29,42 @@ import { cacheGet, cacheSet } from '@/lib/redis';
 const NSE_BASE = 'https://www.nseindia.com';
 const NSE_API  = 'https://www.nseindia.com/api';
 
+// ── Yahoo Finance headers ─────────────────────────────────────────
+const YAHOO_HEADERS = {
+  'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+  'Accept':          'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Referer':         'https://finance.yahoo.com/',
+  'Origin':          'https://finance.yahoo.com',
+};
+
+// Key symbols on Yahoo Finance for NSE indices
+const YAHOO_SYMBOLS = [
+  { name: 'NIFTY 50',   symbol: '^NSEI'    },
+  { name: 'NIFTY BANK', symbol: '^NSEBANK' },
+  { name: 'India VIX',  symbol: '^INDIAVIX' },
+];
+
+async function fetchYahooData(): Promise<void> {
+  await Promise.all(YAHOO_SYMBOLS.map(async ({ symbol }) => {
+    const urls = [
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`,
+      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`,
+    ];
+    for (const url of urls) {
+      try {
+        const res = await fetch(url, { headers: YAHOO_HEADERS, signal: AbortSignal.timeout(10_000) });
+        if (!res.ok) continue;
+        const json   = await res.json();
+        const result = json?.chart?.result?.[0];
+        if (result) return;
+      } catch {
+        // silent — Yahoo is supplementary
+      }
+    }
+  }));
+}
+
 const NSE_HEADERS = {
   'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
   'Accept':          'application/json, text/plain, */*',
@@ -85,7 +121,6 @@ async function nseGet<T>(path: string, ttl = 60, retries = 2): Promise<T | null>
         signal:  AbortSignal.timeout(10_000),
       });
 
-      // Force cookie refresh on auth failure, then retry
       if ((res.status === 401 || res.status === 403) && attempt < retries) {
         await refreshCookie();
         continue;
@@ -197,12 +232,17 @@ export interface NseIndex {
   previousClose: number;
   yearHigh:      number;
   yearLow:       number;
-  advances?:     number;   // available on some index responses
+  advances?:     number;
   declines?:     number;
 }
 
 export async function fetchNseIndices(): Promise<NseIndex[]> {
-  const data = await nseGet<any>('/allIndices', 30);
+  // Run NSE + Yahoo in parallel
+  const [data] = await Promise.all([
+    nseGet<any>('/allIndices', 30),
+    fetchYahooData(),
+  ]);
+
   if (!data?.data) return [];
   return (data.data as any[]).map(d => ({
     name:          String(d.index       ?? ''),
@@ -225,26 +265,44 @@ export async function fetchNseIndices(): Promise<NseIndex[]> {
 // ════════════════════════════════════════════════════════════════
 
 export interface MarketBreadth {
-  advancing:       number;
-  declining:       number;
-  unchanged:       number;
-  total:           number;
+  advancing:             number;
+  declining:             number;
+  unchanged:             number;
+  total:                 number;
   advance_decline_ratio: number | null;
 }
 
 export async function fetchMarketBreadth(): Promise<MarketBreadth> {
-  // Use the Nifty 500 gainers/losers endpoint for breadth
+  // Primary: /allIndices has advances/declines per index — use NIFTY 500 or NIFTY 50
+  const indices = await fetchNseIndices();
+  const n500 = indices.find(i => i.name === 'NIFTY 500');
+  const n50  = indices.find(i => i.name === 'NIFTY 50');
+  const src  = n500 ?? n50;
+
+  if (src?.advances != null && src.advances > 0) {
+    const adv   = src.advances;
+    const dec   = src.declines ?? 0;
+    const total = adv + dec;
+    return {
+      advancing:             adv,
+      declining:             dec,
+      unchanged:             0,
+      total,
+      advance_decline_ratio: dec > 0 ? parseFloat((adv / dec).toFixed(2)) : null,
+    };
+  }
+
+  // Fallback: equity-stockIndices returns all constituents — count up/down stocks
   const data = await nseGet<any>(
-    `/live-analysis-variations?index=${encodeURIComponent('NIFTY 500')}`,
+    `/equity-stockIndices?index=${encodeURIComponent('NIFTY 500')}`,
     60
   );
 
-  const gainers  = (data?.gainers  as any[]) ?? [];
-  const losers   = (data?.losers   as any[]) ?? [];
-  const total    = gainers.length + losers.length;
-  const adv      = gainers.length;
-  const dec      = losers.length;
-  const unch     = 0; // NSE endpoint doesn't provide unchanged count
+  const stocks = (data?.data as any[]) ?? [];
+  const adv    = stocks.filter(s => Number(s.pChange ?? 0) > 0).length;
+  const dec    = stocks.filter(s => Number(s.pChange ?? 0) < 0).length;
+  const unch   = stocks.filter(s => Number(s.pChange ?? 0) === 0).length;
+  const total  = stocks.length;
 
   return {
     advancing:             adv,
@@ -330,9 +388,9 @@ export interface OptionChainRow {
 }
 
 export interface OptionChainResult {
-  records:          OptionChainRow[];
-  underlyingValue:  number;
-  expiryDates:      string[];
+  records:         OptionChainRow[];
+  underlyingValue: number;
+  expiryDates:     string[];
 }
 
 export async function fetchNseOptionChain(
@@ -391,17 +449,36 @@ export interface FiiDiiEntry {
 
 export async function fetchFiiDii(): Promise<FiiDiiEntry[]> {
   const data = await nseGet<any[]>('/fiidiiTradeReact', 3600);
-  if (!Array.isArray(data)) return [];
+  if (!Array.isArray(data) || !data.length) return [];
 
-  return data.slice(0, 10).map((row: any) => ({
-    date:      String(row.date ?? ''),
-    fii_buy:   Number(row.buySell === 'Buy' ? row.amount : 0)  || 0,
-    fii_sell:  Number(row.buySell === 'Sell' ? row.amount : 0) || 0,
-    fii_net:   Number(row.netAmount ?? row.amount ?? 0)        || 0,
-    dii_buy:   Number(row.diiBuySell === 'Buy'  ? row.diiAmount : 0)  || 0,
-    dii_sell:  Number(row.diiBuySell === 'Sell' ? row.diiAmount : 0)  || 0,
-    dii_net:   Number(row.diiNetAmount ?? 0)                   || 0,
-  }));
+  // NSE returns rows per category (FII/DII) per date.
+  // Group by date to produce one FiiDiiEntry per date.
+  const byDate: Record<string, { fii_buy: number; fii_sell: number; fii_net: number; dii_buy: number; dii_sell: number; dii_net: number }> = {};
+
+  for (const row of data) {
+    const date = String(row.date ?? row.tradeDate ?? '');
+    if (!date) continue;
+    if (!byDate[date]) byDate[date] = { fii_buy: 0, fii_sell: 0, fii_net: 0, dii_buy: 0, dii_sell: 0, dii_net: 0 };
+
+    const cat  = String(row.category ?? row.clientType ?? '').toLowerCase();
+    const buy  = Number(row.buyValue  ?? row.buy  ?? row.purchaseValue  ?? row.grossPurchase ?? 0) || 0;
+    const sell = Number(row.sellValue ?? row.sell ?? row.salesValue     ?? row.grossSales    ?? 0) || 0;
+    const net  = Number(row.netValue  ?? row.net  ?? row.netPurchase    ?? (buy - sell)       ?? 0) || (buy - sell);
+
+    if (cat.includes('fii') || cat.includes('fpi') || cat.includes('foreign')) {
+      byDate[date].fii_buy  = buy;
+      byDate[date].fii_sell = sell;
+      byDate[date].fii_net  = net;
+    } else if (cat.includes('dii') || cat.includes('domestic')) {
+      byDate[date].dii_buy  = buy;
+      byDate[date].dii_sell = sell;
+      byDate[date].dii_net  = net;
+    }
+  }
+
+  return Object.entries(byDate)
+    .slice(0, 5)
+    .map(([date, v]) => ({ date, ...v }));
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -412,12 +489,25 @@ export async function fetchGainersLosers(
   type:  'gainers' | 'losers' = 'gainers',
   index: string               = 'NIFTY 500'
 ): Promise<any[]> {
+  // /live-analysis-variations is broken (returns "Missing index or key").
+  // Use /equity-stockIndices instead — returns all constituents, sort by pChange.
   const data = await nseGet<any>(
-    `/live-analysis-variations?index=${encodeURIComponent(index)}`,
+    `/equity-stockIndices?index=${encodeURIComponent(index)}`,
     60
   );
-  if (!data) return [];
-  return type === 'gainers' ? (data.gainers ?? []) : (data.losers ?? []);
+
+  if (!data?.data) return [];
+
+  const stocks: any[] = data.data;
+  const sorted = [...stocks].sort((a, b) => {
+    const pa = Number(a.pChange ?? 0);
+    const pb = Number(b.pChange ?? 0);
+    return type === 'gainers' ? pb - pa : pa - pb;
+  });
+
+  return type === 'gainers'
+    ? sorted.filter(s => Number(s.pChange ?? 0) > 0)
+    : sorted.filter(s => Number(s.pChange ?? 0) < 0);
 }
 
 // ════════════════════════════════════════════════════════════════

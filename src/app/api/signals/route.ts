@@ -26,6 +26,7 @@ import {
   logRejection,
 }                                     from '@/services/signalEngine';
 import { getRejectionAnalysis }       from '@/services/performanceTracker';
+import { fetchGainersLosers }         from '@/services/nse';
 
 export const dynamic   = 'force-dynamic';
 export const revalidate = 0;
@@ -102,10 +103,22 @@ export async function GET(req: NextRequest) {
       rows = r.rows || [];
     } catch {}
 
+    // Rankings table empty — fall back to NSE top gainers
+    if (!rows.length) {
+      try {
+        const gainers = await fetchGainersLosers('gainers');
+        rows = gainers.slice(0, limit * 4).map((g: any) => {
+          const meta = g.meta ?? g;
+          const sym  = String(meta.symbol ?? g.symbol ?? '').toUpperCase();
+          return { instrument_key: `NSE_EQ|${sym}`, tradingsymbol: sym, exchange: 'NSE' };
+        }).filter((r: any) => r.tradingsymbol);
+      } catch { /* NSE unavailable */ }
+    }
+
     if (!rows.length) {
       return NextResponse.json({
         signals: [],
-        note: 'No ranked instruments. Run Admin → Data Management → Sync Rankings first.',
+        note: 'No data available. Markets may be closed or NSE is unreachable.',
       });
     }
 

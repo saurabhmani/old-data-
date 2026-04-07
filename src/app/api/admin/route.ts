@@ -14,7 +14,7 @@
 import { NextRequest, NextResponse }    from 'next/server';
 import { requireSession }               from '@/lib/session';
 import { db }                           from '@/lib/db';
-import { syncInstrumentsFromCdn } from '@/services/dataSync';
+import { syncInstrumentsFromCdn, syncRankingsFromNse } from '@/services/dataSync';
 import { generateSignal,
          persistSignal,
          logRejection }                 from '@/services/signalEngine';
@@ -100,7 +100,18 @@ export async function POST(req: NextRequest) {
 
   let body: any = {};
   try { body = await req.json(); } catch {}
-  const action = body.action || req.nextUrl.searchParams.get('action') || '';
+
+  // Normalise: accept both `action` and `type` keys, and map UI shorthand names
+  // to the full action names used internally.
+  const rawAction = body.action || body.type || req.nextUrl.searchParams.get('action') || '';
+  const ACTION_ALIASES: Record<string, string> = {
+    'rankings':        'sync_rankings',
+    'signals':         'recompute_signals',
+    'instruments-nse': 'sync_instruments_nse',
+    'instruments-bse': 'sync_instruments_bse',
+    'instruments-fo':  'sync_instruments_fo',
+  };
+  const action = ACTION_ALIASES[rawAction] ?? rawAction;
 
   // ── Instrument sync ───────────────────────────────────────────
   if (action === 'sync_instruments_nse') {
@@ -119,9 +130,14 @@ export async function POST(req: NextRequest) {
   // ── Rankings sync ─────────────────────────────────────────────
   if (action === 'sync_rankings') {
     try {
-      const { refreshMarketUniverse } = await import('@/services/dataAggregator');
-      await refreshMarketUniverse();
-      return NextResponse.json({ ok: true, message: 'Rankings refresh triggered' });
+      // Step 1: populate rankings table from NSE live movers
+      const r = await syncRankingsFromNse();
+      // Step 2: if rankings were inserted, also prime the Redis cache
+      if (r.inserted > 0) {
+        const { refreshMarketUniverse } = await import('@/services/dataAggregator');
+        refreshMarketUniverse().catch(() => {}); // non-blocking
+      }
+      return NextResponse.json({ ok: true, message: r.message });
     } catch (e: any) {
       return NextResponse.json({ ok: false, error: e.message }, { status: 500 });
     }

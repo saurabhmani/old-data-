@@ -24,13 +24,55 @@ export async function GET(req: NextRequest) {
 
   if (resource === 'gainers') {
     const data = await fetchGainersLosers('gainers');
-    return NextResponse.json({ gainers: data });
+    return NextResponse.json({
+      count: data.length,
+      first_item: data[0] ?? null,   // raw first item so we can see the structure
+      gainers: data.slice(0, 5),
+    });
   }
 
   if (resource === 'losers') {
     const data = await fetchGainersLosers('losers');
-    return NextResponse.json({ losers: data });
+    return NextResponse.json({
+      count: data.length,
+      first_item: data[0] ?? null,
+      losers: data.slice(0, 5),
+    });
   }
 
-  return NextResponse.json({ error: 'Invalid resource. Use: indices, quote, gainers, losers' }, { status: 400 });
+  // Raw NSE probe — fetch gainers/losers endpoint without any processing
+  if (resource === 'raw-gainers') {
+    try {
+      const NSE_API = 'https://www.nseindia.com/api';
+      const NSE_HEADERS = {
+        'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+        'Accept':          'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer':         'https://www.nseindia.com/',
+      };
+      // Get cookie first
+      const homeRes = await fetch('https://www.nseindia.com/', { headers: NSE_HEADERS, signal: AbortSignal.timeout(8000) });
+      const cookie  = homeRes.headers.get('set-cookie') ?? '';
+      // Fetch gainers
+      const res = await fetch(
+        `${NSE_API}/live-analysis-variations?index=${encodeURIComponent('NIFTY 500')}`,
+        { headers: { ...NSE_HEADERS, Cookie: cookie }, signal: AbortSignal.timeout(10000) }
+      );
+      const status = res.status;
+      if (!res.ok) return NextResponse.json({ status, error: 'NSE returned non-200', cookie_set: !!cookie });
+      const raw = await res.json();
+      return NextResponse.json({
+        status,
+        cookie_set: !!cookie,
+        keys: Object.keys(raw ?? {}),
+        gainers_count: raw?.gainers?.length ?? 0,
+        losers_count:  raw?.losers?.length  ?? 0,
+        first_gainer:  raw?.gainers?.[0]    ?? null,
+      });
+    } catch (e: any) {
+      return NextResponse.json({ error: e.message });
+    }
+  }
+
+  return NextResponse.json({ error: 'Invalid resource. Use: indices, quote, gainers, losers, raw-gainers' }, { status: 400 });
 }

@@ -50,7 +50,8 @@ export interface Instrument {
 export interface Tick {
   instrument_key: string;
   ltp: number | null;
-  open?: number | null;
+  open?: number |
+   null;
   high?: number | null;
   low?: number | null;
   close?: number | null;

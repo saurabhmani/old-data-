@@ -205,48 +205,67 @@ export async function getLatestCandleFromDb(
 
 // ── Layer 4: Yahoo Finance ─────────────────────────────────────────
 
-async function fetchFromYahoo(symbol: string, instrumentKey: string): Promise<MarketSnapshot | null> {
-  try {
-    const yahooSym = symbol.endsWith('.NS') ? symbol : `${symbol}.NS`;
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=1d`;
-    const res  = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return null;
+const YAHOO_HEADERS = {
+  'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+  'Accept':          'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Referer':         'https://finance.yahoo.com/',
+  'Origin':          'https://finance.yahoo.com',
+};
 
-    const json   = await res.json();
-    const result = json?.chart?.result?.[0];
-    if (!result) return null;
-
-    const meta   = result.meta ?? {};
-    const quote  = result.indicators?.quote?.[0] ?? {};
-    const idx    = (result.timestamp?.length ?? 0) - 1;
-
-    const ltp    = n(meta.regularMarketPrice || meta.previousClose);
-    if (!ltp) return null;
-
-    return {
-      symbol:         symbol.toUpperCase(),
-      instrument_key: instrumentKey || `NSE_EQ|${symbol}`,
-      ltp,
-      open:           n(quote.open?.[idx]   ?? meta.chartPreviousClose),
-      high:           n(quote.high?.[idx]   ?? ltp),
-      low:            n(quote.low?.[idx]    ?? ltp),
-      close:          n(meta.chartPreviousClose ?? ltp),
-      volume:         n(quote.volume?.[idx] ?? 0),
-      oi:             0,
-      change_percent: n(meta.regularMarketChangePercent),
-      change_abs:     n(meta.regularMarketChange),
-      vwap:           null,
-      week52_high:    n(meta.fiftyTwoWeekHigh),
-      week52_low:     n(meta.fiftyTwoWeekLow),
-      atr14:          null,
-      delivery_pct:   null,
-      timestamp:      Date.now(),
-      source:         'yahoo',
-      data_quality:   0.25,
-    };
-  } catch {
-    return null;
+async function yahooFetch(url: string): Promise<any | null> {
+  const urls = [url, url.replace('query1.finance.yahoo.com', 'query2.finance.yahoo.com')];
+  for (const u of urls) {
+    try {
+      const res = await fetch(u, { headers: YAHOO_HEADERS, signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) continue;
+      const json   = await res.json();
+      const result = json?.chart?.result?.[0];
+      if (result) return result;
+    } catch {
+      // silent fallback to query2
+    }
   }
+  return null;
+}
+
+async function fetchFromYahoo(symbol: string, instrumentKey: string): Promise<MarketSnapshot | null> {
+  const yahooSym = symbol.endsWith('.NS') ? symbol : `${symbol}.NS`;
+  const url      = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=1d`;
+
+  const result = await yahooFetch(url);
+  if (!result) return null;
+
+  const meta  = result.meta ?? {};
+  const quote = result.indicators?.quote?.[0] ?? {};
+  const idx   = (result.timestamp?.length ?? 0) - 1;
+
+  const ltp = n(meta.regularMarketPrice || meta.previousClose);
+  if (!ltp) return null;
+
+  const snap: MarketSnapshot = {
+    symbol:         symbol.toUpperCase(),
+    instrument_key: instrumentKey || `NSE_EQ|${symbol}`,
+    ltp,
+    open:           n(quote.open?.[idx]   ?? meta.chartPreviousClose),
+    high:           n(quote.high?.[idx]   ?? ltp),
+    low:            n(quote.low?.[idx]    ?? ltp),
+    close:          n(meta.chartPreviousClose ?? ltp),
+    volume:         n(quote.volume?.[idx] ?? 0),
+    oi:             0,
+    change_percent: n(meta.regularMarketChangePercent),
+    change_abs:     n(meta.regularMarketChange),
+    vwap:           null,
+    week52_high:    n(meta.fiftyTwoWeekHigh),
+    week52_low:     n(meta.fiftyTwoWeekLow),
+    atr14:          null,
+    delivery_pct:   null,
+    timestamp:      Date.now(),
+    source:         'yahoo',
+    data_quality:   0.25,
+  };
+
+  return snap;
 }
 
 // ── ATR computation from MySQL candles ────────────────────────────
@@ -320,17 +339,24 @@ export async function getMarketSnapshot(
   const cached = await readFromCache(sym);
   if (cached && cached.data_quality >= 0.40) return cached;
 
-  // Layer 2: NSE
-  let snap = await fetchFromNse(sym, instrumentKey);
+  // Layer 2: NSE + Yahoo run in parallel
+  const [nseSnap, yahooSnap] = await Promise.all([
+    fetchFromNse(sym, instrumentKey),
+    fetchFromYahoo(sym, instrumentKey),
+  ]);
+
+  // NSE is preferred; fall through to DB then Yahoo if NSE fails
+  let snap = nseSnap;
 
   // Layer 3: MySQL candle (if NSE is unavailable)
   if (!snap) {
     snap = await getLatestCandleFromDb(instrumentKey);
   }
 
-  // Layer 4: Yahoo Finance (last resort)
-  if (!snap) {
-    snap = await fetchFromYahoo(sym, instrumentKey);
+  // Layer 4: use already-fetched Yahoo result as final fallback
+  if (!snap && yahooSnap) {
+    console.log(`[Yahoo] Using Yahoo as final fallback for ${sym}`);
+    snap = yahooSnap;
   }
 
   if (!snap) return cached ?? null; // return stale cache if all layers fail

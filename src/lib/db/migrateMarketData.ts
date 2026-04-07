@@ -1,20 +1,48 @@
 /**
  * Market Data Architecture Migration
- * Adds / updates the candles table with correct MySQL syntax.
- * Safe to re-run — uses IF NOT EXISTS / IF NOT EXISTS column checks.
+ * Adds / updates the candles and market_data_snapshots tables.
+ * Safe to re-run — uses IF NOT EXISTS.
  *
- * Run: npx ts-node src/lib/db/migrateMarketData.ts
+ * Run: npx ts-node -P tsconfig.node.json -r tsconfig-paths/register src/lib/db/migrateMarketData.ts
  */
+import mysql from 'mysql2/promise';
+import fs    from 'fs';
+import path  from 'path';
 
-import { getDb } from '../db';
+// Load .env.local without dotenv dependency (same pattern as all other migration files)
+try {
+  const envFile = fs.readFileSync(path.resolve(process.cwd(), '.env.local'), 'utf-8');
+  for (const line of envFile.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx > 0) {
+      const key = trimmed.slice(0, eqIdx).trim();
+      const val = trimmed.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, '');
+      if (!process.env[key]) process.env[key] = val;
+    }
+  }
+} catch {}
 
 async function migrateMarketData() {
-  const pool = getDb();
-  console.log('🔄 Running market data migration...\n');
+  const url = process.env.DATABASE_URL;
+  if (!url) throw new Error('DATABASE_URL not set — check .env.local');
+  const parsed = new URL(url);
+
+  const conn = await mysql.createConnection({
+    host:     parsed.hostname,
+    port:     parsed.port ? parseInt(parsed.port, 10) : 3306,
+    user:     decodeURIComponent(parsed.username),
+    password: decodeURIComponent(parsed.password),
+    database: parsed.pathname?.slice(1) || 'quantorus365',
+    multipleStatements: true,
+  });
+
+  console.log('Running market data migration...\n');
 
   try {
-    // ── candles table (MySQL syntax) ──────────────────────────────
-    await pool.execute(`
+    // ── candles table ─────────────────────────────────────────────
+    await conn.execute(`
       CREATE TABLE IF NOT EXISTS candles (
         id             INT AUTO_INCREMENT PRIMARY KEY,
         instrument_key VARCHAR(150) NOT NULL,
@@ -31,15 +59,14 @@ async function migrateMarketData() {
         KEY idx_candles_key_ts (instrument_key, ts DESC)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
-    console.log('✓ candles table ready');
+    console.log('✓ candles');
 
     // ── market_data_snapshots (latest live snapshot per symbol) ──
-    // Stores the most recent MarketSnapshot for non-Redis environments
-    await pool.execute(`
+    await conn.execute(`
       CREATE TABLE IF NOT EXISTS market_data_snapshots (
         id             INT AUTO_INCREMENT PRIMARY KEY,
-        symbol         VARCHAR(50)  NOT NULL,
-        instrument_key VARCHAR(150) NOT NULL,
+        symbol         VARCHAR(50)   NOT NULL,
+        instrument_key VARCHAR(150)  NOT NULL,
         ltp            DECIMAL(12,2) DEFAULT 0,
         open_price     DECIMAL(12,2) DEFAULT 0,
         high_price     DECIMAL(12,2) DEFAULT 0,
@@ -57,21 +84,14 @@ async function migrateMarketData() {
         KEY idx_snap_updated (updated_at DESC)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
-    console.log('✓ market_data_snapshots table ready');
+    console.log('✓ market_data_snapshots');
 
-    // ── instrument_sync_logs already exists — no changes needed ──
-    console.log('✓ instrument_sync_logs already present');
-
-    console.log('\n✅ Market data migration complete.\n');
-    console.log('Tables:');
-    console.log('  candles                — OHLCV per instrument per interval');
-    console.log('  market_data_snapshots  — latest live snapshot fallback (non-Redis)');
-
+    console.log('\n✅ Market data migration complete.');
   } catch (err) {
     console.error('❌ Migration failed:', err);
     process.exit(1);
   } finally {
-    await pool.end();
+    await conn.end();
   }
 }
 

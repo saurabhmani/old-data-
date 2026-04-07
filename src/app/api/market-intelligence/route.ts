@@ -22,19 +22,22 @@ export async function GET(_req: NextRequest) {
   catch { return NextResponse.json({ error: 'Unauthorized' }, { status: 401 }); }
 
   try {
-    const [intelRes, scenarioRes, regimeRes] = await Promise.allSettled([
+    // Step 1: compute market intelligence FIRST — scenario reads from its cache.
+    // Running them in parallel causes scenario to see an empty intel cache on cold start.
+    const [intelRes, regimeRes] = await Promise.allSettled([
       computeMarketIntelligence(),
-      computeScenario(),
       cacheGet<{ regime: string; set_at?: string }>('market:regime'),
     ]);
 
-    const intel    = intelRes.status === 'fulfilled'    ? intelRes.value    : null;
-    const scenario = scenarioRes.status === 'fulfilled' ? scenarioRes.value : null;
-    const regime   = regimeRes.status === 'fulfilled'   ? regimeRes.value   : null;
+    const intel  = intelRes.status === 'fulfilled'  ? intelRes.value  : null;
+    const regime = regimeRes.status === 'fulfilled' ? regimeRes.value : null;
 
+    // Step 2: scenario and stance now read from the freshly cached intelligence.
+    const scenario = await computeScenario().catch(() => null);
     const stance = scenario
       ? await computeMarketStance(scenario).catch(() => null)
       : null;
+
 
     return NextResponse.json({
       // Market direction

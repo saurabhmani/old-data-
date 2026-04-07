@@ -130,6 +130,14 @@ const RANGE_FOR_INTERVAL: Record<ChartInterval, string> = {
   '1month':   '5y',
 };
 
+const YAHOO_HEADERS = {
+  'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+  'Accept':          'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Referer':         'https://finance.yahoo.com/',
+  'Origin':          'https://finance.yahoo.com',
+};
+
 async function fromYahoo(
   symbol:   string,
   interval: ChartInterval,
@@ -137,50 +145,57 @@ async function fromYahoo(
   to?:      string,
   limit     = 200
 ): Promise<OhlcvBar[]> {
-  try {
-    const yahooSym  = symbol.endsWith('.NS') ? symbol : `${symbol}.NS`;
-    const yInterval = INTERVAL_MAP[interval] ?? '1d';
-    const range     = RANGE_FOR_INTERVAL[interval] ?? '1y';
+  const yahooSym  = symbol.endsWith('.NS') ? symbol : `${symbol}.NS`;
+  const yInterval = INTERVAL_MAP[interval] ?? '1d';
+  const range     = RANGE_FOR_INTERVAL[interval] ?? '1y';
 
-    let url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}`
-            + `?interval=${yInterval}&range=${range}&includeAdjustedClose=false`;
+  let baseUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}`
+              + `?interval=${yInterval}&range=${range}&includeAdjustedClose=false`;
 
-    if (from) url += `&period1=${Math.floor(new Date(from).getTime() / 1000)}`;
-    if (to)   url += `&period2=${Math.floor(new Date(to).getTime() / 1000)}`;
+  if (from) baseUrl += `&period1=${Math.floor(new Date(from).getTime() / 1000)}`;
+  if (to)   baseUrl += `&period2=${Math.floor(new Date(to).getTime() / 1000)}`;
 
-    const res = await fetch(url, { signal: AbortSignal.timeout(12_000) });
-    if (!res.ok) return [];
+  // Try query1, fall back to query2
+  const urls = [baseUrl, baseUrl.replace('query1.finance.yahoo.com', 'query2.finance.yahoo.com')];
+  let result: any = null;
 
-    const json    = await res.json();
-    const result  = json?.chart?.result?.[0];
-    if (!result)  return [];
-
-    const timestamps = result.timestamp ?? [];
-    const quote      = result.indicators?.quote?.[0] ?? {};
-    const open   = quote.open   ?? [];
-    const high   = quote.high   ?? [];
-    const low    = quote.low    ?? [];
-    const close  = quote.close  ?? [];
-    const volume = quote.volume ?? [];
-
-    const bars: OhlcvBar[] = [];
-    for (let i = 0; i < timestamps.length; i++) {
-      if (close[i] == null) continue;
-      bars.push({
-        ts:     new Date(timestamps[i] * 1000).toISOString(),
-        open:   parseFloat((open[i]   ?? close[i]).toFixed(2)),
-        high:   parseFloat((high[i]   ?? close[i]).toFixed(2)),
-        low:    parseFloat((low[i]    ?? close[i]).toFixed(2)),
-        close:  parseFloat(Number(close[i]).toFixed(2)),
-        volume: parseInt(volume[i] ?? '0') || 0,
-        oi:     0,
-      });
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { headers: YAHOO_HEADERS, signal: AbortSignal.timeout(12_000) });
+      if (!res.ok) continue;
+      const json = await res.json();
+      result = json?.chart?.result?.[0];
+      if (result) break;
+    } catch {
+      // silent fallback to query2
     }
-
-    return bars.slice(-limit);
-  } catch {
-    return [];
   }
+
+  if (!result) return [];
+
+  const timestamps = result.timestamp ?? [];
+  const quote      = result.indicators?.quote?.[0] ?? {};
+  const open   = quote.open   ?? [];
+  const high   = quote.high   ?? [];
+  const low    = quote.low    ?? [];
+  const close  = quote.close  ?? [];
+  const volume = quote.volume ?? [];
+
+  const bars: OhlcvBar[] = [];
+  for (let i = 0; i < timestamps.length; i++) {
+    if (close[i] == null) continue;
+    bars.push({
+      ts:     new Date(timestamps[i] * 1000).toISOString(),
+      open:   parseFloat((open[i]   ?? close[i]).toFixed(2)),
+      high:   parseFloat((high[i]   ?? close[i]).toFixed(2)),
+      low:    parseFloat((low[i]    ?? close[i]).toFixed(2)),
+      close:  parseFloat(Number(close[i]).toFixed(2)),
+      volume: parseInt(volume[i] ?? '0') || 0,
+      oi:     0,
+    });
+  }
+
+  return bars.slice(-limit);
 }
 
 // ── Persist Yahoo candles to MySQL (async, non-blocking) ──────────

@@ -25,7 +25,9 @@ export async function GET() {
   catch { return NextResponse.json({ error: 'Unauthorized' }, { status: 401 }); }
 
   try {
-    // Run scenario + stance first so rankings have current context
+    // Compute scenario + regime in parallel with rankings/portfolio data.
+    // Note: scenario reads from market:intelligence cache — if the cache is cold,
+    // computeScenario() will fall back to NSE indices directly (acceptable for dashboard).
     const [scenarioRes, rankingsResult, regimeData, portfolioData, signalStats] =
       await Promise.allSettled([
 

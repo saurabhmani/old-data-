@@ -8,8 +8,9 @@
  *   regime alignment + portfolio fit + scenario alignment
  */
 
-import { cacheGet, cacheSet } from '@/lib/redis';
-import { db }                 from '@/lib/db';
+import { cacheGet, cacheSet }                    from '@/lib/redis';
+import { db }                                    from '@/lib/db';
+import { fetchNseIndices, fetchGainersLosers }   from './nse';
 
 export type SignalType = 'BUY' | 'SELL' | 'HOLD' | null;
 
@@ -206,6 +207,66 @@ async function fetchFromMySQL(
   }
 }
 
+// ── NSE live fallback when rankings table is empty ────────────────
+
+async function buildFromNse(limit: number): Promise<RankedEntry[]> {
+  // Layer 1: try NSE gainers/losers endpoint (individual stocks)
+  try {
+    const [gainers, losers] = await Promise.all([
+      fetchGainersLosers('gainers'),
+      fetchGainersLosers('losers'),
+    ]);
+    const all = [...gainers, ...losers];
+    if (all.length > 0) {
+      return all.slice(0, limit).map((g: any, idx) => {
+        const d    = Array.isArray(g.data) ? g.data[0] : g;
+        const meta = g.meta ?? g;
+        const sym  = String(meta.symbol ?? g.symbol ?? '').toUpperCase();
+        const pct  = parseFloat(String(d.pChange ?? d.perChange ?? g.pChange ?? g.perChange ?? 0)) || 0;
+        const ltp  = parseFloat(String(d.ltp ?? d.lastPrice ?? d.ltP ?? g.ltp ?? g.lastPrice ?? 0)) || 0;
+        const name = String(meta.companyName ?? d.symbolName ?? g.symbolName ?? sym);
+        const score = Math.min(100, Math.max(0, 50 + pct * 2));
+        const partial: Partial<RankedEntry> = {
+          symbol: sym, name, exchange: 'NSE',
+          instrument_key: `NSE_EQ|${sym}`,
+          score, rank_position: idx + 1, ltp, pct_change: pct,
+          volume: parseFloat(String(d.tradedQuantity ?? g.tradedQuantity ?? 0)) || 0,
+          signal_type: null, confidence: null, confidence_score: null,
+          risk_score: null, scenario_tag: null, market_stance: null,
+          regime: null, conviction_band: null, portfolio_fit_score: null,
+          signal_age_min: null, data_source: 'redis' as const,
+        };
+        partial.opportunity_rank = computeOpportunityRank(partial);
+        return partial as RankedEntry;
+      }).filter(r => r.symbol);
+    }
+  } catch { /* NSE gainers unavailable */ }
+
+  // Layer 2: NSE indices (always works — same source as VIX)
+  try {
+    const indices = await fetchNseIndices();
+    const valid = indices
+      .filter(i => i.last > 0 && i.name !== 'INDIA VIX')
+      .sort((a, b) => Math.abs(b.percentChange) - Math.abs(a.percentChange))
+      .slice(0, limit);
+
+    return valid.map((i, idx) => {
+      const score = Math.min(100, Math.max(0, 50 + i.percentChange * 2));
+      const partial: Partial<RankedEntry> = {
+        symbol: i.name, name: i.name, exchange: 'NSE',
+        instrument_key: `NSE_IDX|${i.name}`,
+        score, rank_position: idx + 1, ltp: i.last, pct_change: i.percentChange,
+        volume: 0, signal_type: null, confidence: null, confidence_score: null,
+        risk_score: null, scenario_tag: null, market_stance: null,
+        regime: null, conviction_band: null, portfolio_fit_score: null,
+        signal_age_min: null, data_source: 'redis' as const,
+      };
+      partial.opportunity_rank = computeOpportunityRank(partial);
+      return partial as RankedEntry;
+    });
+  } catch { return []; }
+}
+
 // ── Public API ────────────────────────────────────────────────────
 
 export async function getRankings(opts: {
@@ -226,6 +287,19 @@ export async function getRankings(opts: {
 
   const { rows, total } = await fetchFromMySQL(limit, offset, exchange);
   rows.sort((a, b) => b.opportunity_rank - a.opportunity_rank);
+
+  // MySQL is empty — auto-seed from NSE live data
+  if (rows.length === 0 && page === 1) {
+    const nseRows = await buildFromNse(limit);
+    if (nseRows.length > 0) {
+      nseRows.sort((a, b) => b.opportunity_rank - a.opportunity_rank);
+      return {
+        data: nseRows, count: nseRows.length, total: nseRows.length,
+        page, limit, has_more: false,
+        data_source: 'redis', as_of: new Date().toISOString(),
+      };
+    }
+  }
 
   const result: RankingsResult = {
     data: rows, count: rows.length, total, page, limit,

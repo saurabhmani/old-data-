@@ -4,6 +4,8 @@ let redis: Redis | null = null;
 let redisFailed = false;
 
 function getRedis(): Redis | null {
+  // Respect REDIS_DISABLED env var — treat as permanently unavailable
+  if (process.env.REDIS_DISABLED === '1') return null;
   if (redisFailed) return null;
   if (!redis) {
     try {

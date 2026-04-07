@@ -14,7 +14,7 @@ export default function PortfolioPage() {
   const [summary,   setSummary]   = useState<PortfolioSummary | null>(null);
   const [loading,   setLoading]   = useState(true);
   const [modal,     setModal]     = useState(false);
-  const [form,      setForm]      = useState(empty);
+  const [form,      setForm]      = useState(empty); 
   const [saving,    setSaving]    = useState(false);
   const [error,     setError]     = useState('');
 

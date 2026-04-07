@@ -1,3 +1,5 @@
+
+
 /**
  * Market Intelligence Service
  *
@@ -18,9 +20,10 @@
  *   candles   — for volatility calculation
  */
 
-import { cacheGet, cacheSet }  from '@/lib/redis';
-import { db }                  from '@/lib/db';
-import type { MarketSnapshot } from './marketDataService';
+import { cacheGet, cacheSet }                          from '@/lib/redis';
+import { db }                                           from '@/lib/db';
+import { fetchNseIndices, fetchFiiDii, fetchGainersLosers } from './nse';
+import type { MarketSnapshot }                         from './marketDataService';
 
 // ── Output types ─────────────────────────────────────────────────
 
@@ -81,11 +84,17 @@ export interface MarketIntelligenceResult {
 const INTEL_CACHE_KEY = 'market:intelligence';
 const INTEL_CACHE_TTL = 60; // seconds — refreshed by scheduler anyway
 
+// In-process memory cache — ensures scenario engine can read the result
+// even when Redis is disabled (REDIS_DISABLED=1).
+let _memCache: MarketIntelligenceResult | null = null;
+let _memCacheAt = 0;
+const MEM_CACHE_TTL_MS = 60_000;
+
 // ── Sector index → Redis key mapping ─────────────────────────────
 // These keys are written by nse.ts → nseGet('/allIndices')
 const NSE_INDICES_KEY  = 'nse:/allIndices';
 const NSE_FIIDII_KEY   = 'nse:/fiidiiTradeReact';
-const NSE_GAINERS_KEY  = 'nse:/live-analysis-variations?index=NIFTY%20500';
+const NSE_GAINERS_KEY  = 'nse:/equity-stockIndices?index=NIFTY%20500';
 
 const SECTOR_INDEX_NAMES: Record<string, string> = {
   'NIFTY BANK':        'Banking',
@@ -244,43 +253,65 @@ async function getVolatilityMysql(): Promise<VolatilityMetrics> {
 
 // ── FII/DII normaliser ────────────────────────────────────────────
 
+// NSE returns one row per category (FII/FPI, DII) per date.
+// Group by date first, then combine FII and DII into a single entry per date.
 function normaliseFiiDii(raw: any[]): FiiDiiEntry[] {
   if (!Array.isArray(raw) || !raw.length) return [];
-  return raw.slice(0, 5).map(row => {
-    // NSE FII/DII field names vary — handle both formats
-    const fiiBuy  = toNum(row.fiiBuyValue  ?? row.buyValue  ?? row.FII_BUY  ?? 0);
-    const fiiSell = toNum(row.fiiSellValue ?? row.sellValue ?? row.FII_SELL ?? 0);
-    const diiBuy  = toNum(row.diiBuyValue  ?? row.DIIbuyValue ?? row.DII_BUY ?? 0);
-    const diiSell = toNum(row.diiSellValue ?? row.DIIsellValue ?? row.DII_SELL ?? 0);
-    const fiiNet  = fiiBuy - fiiSell;
-    const diiNet  = diiBuy - diiSell;
-    const date    = String(row.date ?? row.tradeDate ?? row.Date ?? '');
 
-    return {
-      date,
-      fii_buy:   fiiBuy,
-      fii_sell:  fiiSell,
-      fii_net:   fiiNet,
-      dii_buy:   diiBuy,
-      dii_sell:  diiSell,
-      dii_net:   diiNet,
-      fii_label: fiiNet > 0
-        ? `FII net bought ₹${(Math.abs(fiiNet) / 100).toFixed(0)} Cr`
-        : `FII net sold ₹${(Math.abs(fiiNet) / 100).toFixed(0)} Cr`,
-      dii_label: diiNet > 0
-        ? `DII net bought ₹${(Math.abs(diiNet) / 100).toFixed(0)} Cr`
-        : `DII net sold ₹${(Math.abs(diiNet) / 100).toFixed(0)} Cr`,
-    };
-  });
+  const byDate: Record<string, { fii_buy: number; fii_sell: number; fii_net: number; dii_buy: number; dii_sell: number; dii_net: number }> = {};
+
+  for (const row of raw) {
+    const date = String(row.date ?? row.tradeDate ?? row.Date ?? '');
+    if (!date) continue;
+    if (!byDate[date]) byDate[date] = { fii_buy: 0, fii_sell: 0, fii_net: 0, dii_buy: 0, dii_sell: 0, dii_net: 0 };
+
+    const cat  = String(row.category ?? row.clientType ?? '').toLowerCase();
+    const buy  = toNum(row.buyValue  ?? row.buy  ?? row.purchaseValue  ?? row.grossPurchase ?? 0);
+    const sell = toNum(row.sellValue ?? row.sell ?? row.salesValue     ?? row.grossSales    ?? 0);
+    const net  = toNum(row.netValue  ?? row.net  ?? row.netPurchase    ?? (buy - sell));
+
+    if (cat.includes('fii') || cat.includes('fpi') || cat.includes('foreign')) {
+      byDate[date].fii_buy  = buy;
+      byDate[date].fii_sell = sell;
+      byDate[date].fii_net  = net;
+    } else if (cat.includes('dii') || cat.includes('domestic')) {
+      byDate[date].dii_buy  = buy;
+      byDate[date].dii_sell = sell;
+      byDate[date].dii_net  = net;
+    }
+  }
+
+  return Object.entries(byDate).slice(0, 5).map(([date, v]) => ({
+    date,
+    fii_buy:   v.fii_buy,
+    fii_sell:  v.fii_sell,
+    fii_net:   v.fii_net,
+    dii_buy:   v.dii_buy,
+    dii_sell:  v.dii_sell,
+    dii_net:   v.dii_net,
+    fii_label: v.fii_net > 0
+      ? `FII net bought ₹${(Math.abs(v.fii_net) / 100).toFixed(0)} Cr`
+      : `FII net sold ₹${(Math.abs(v.fii_net) / 100).toFixed(0)} Cr`,
+    dii_label: v.dii_net > 0
+      ? `DII net bought ₹${(Math.abs(v.dii_net) / 100).toFixed(0)} Cr`
+      : `DII net sold ₹${(Math.abs(v.dii_net) / 100).toFixed(0)} Cr`,
+  }));
 }
 
 // ── Main compute function ─────────────────────────────────────────
 
 export async function computeMarketIntelligence(): Promise<MarketIntelligenceResult> {
 
-  // ── Step 0: Check intelligence cache (pre-computed result) ──────
+  // ── Step 0: Check intelligence cache ────────────────────────────
+  // 1. In-process memory cache (survives Redis being disabled)
+  //    Skip if cached result has no movers — forces a fresh NSE fetch
+  const memValid = _memCache &&
+    Date.now() - _memCacheAt < MEM_CACHE_TTL_MS &&
+    _memCache.top_gainers.length > 0;
+  if (memValid) return _memCache!;
+  // 2. Redis cache
   const cached = await cacheGet<MarketIntelligenceResult>(INTEL_CACHE_KEY);
-  if (cached) return cached;
+  if (cached) { _memCache = cached; _memCacheAt = Date.now(); return cached; }
 
   let dataSource: MarketIntelligenceResult['data_source'] = 'redis';
   let oldestSnapshotMs: number | null = null;
@@ -345,9 +376,39 @@ export async function computeMarketIntelligence(): Promise<MarketIntelligenceRes
     declining   = mysql.declining;
     unchanged   = mysql.unchanged;
     dataSource  = 'mysql';
+
+    // NSE direct fallback — rankings table empty, fetch breadth from NSE
+    if (advancing === 0 && declining === 0) {
+      try {
+        const { fetchMarketBreadth } = await import('./nse');
+        const breadth = await fetchMarketBreadth();
+        advancing  = breadth.advancing;
+        declining  = breadth.declining;
+        unchanged  = breadth.unchanged ?? 0;
+        const total = advancing + declining || 1;
+        trendScore  = Math.round(Math.max(-100, Math.min(100, ((advancing - declining) / total) * 70)));
+        dataSource  = 'mixed';
+      } catch { /* NSE breadth unavailable */ }
+    }
   }
 
-  // ── Step 4: Top gainers + losers ────────────────────────────────
+  // ── Step 4a: Fetch NSE indices (used by steps 4b, 5, 7) ─────────
+  const cachedIndices = await cacheGet<any>(NSE_INDICES_KEY);
+  let   indicesData: any[] = cachedIndices?.data ?? [];
+
+  if (!indicesData.length) {
+    try {
+      const live = await fetchNseIndices();
+      indicesData = live.map(i => ({
+        index: i.name, name: i.name,
+        percentChange: i.percentChange, last: i.last,
+        variation: i.variation, high: i.high, low: i.low,
+        advances: i.advances, declines: i.declines,
+      }));
+    } catch { /* NSE unavailable */ }
+  }
+
+  // ── Step 4b: Top gainers + losers ───────────────────────────────
   let topGainers: MoverEntry[] = [];
   let topLosers:  MoverEntry[] = [];
 
@@ -371,18 +432,60 @@ export async function computeMarketIntelligence(): Promise<MarketIntelligenceRes
       volume:         s.volume,
     }));
   } else {
-    // MySQL fallback
+    // Layer 1: MySQL rankings
     [topGainers, topLosers] = await Promise.all([
       getMoversMysql('gainers', 10),
       getMoversMysql('losers',  10),
     ]);
+
+    // Layer 2: NSE live gainers/losers endpoint
+    if (!topGainers.length) {
+      try {
+        const [nseGainers, nseLosers] = await Promise.all([
+          fetchGainersLosers('gainers'),
+          fetchGainersLosers('losers'),
+        ]);
+        // NSE response can be flat { symbol, ltp, pChange }
+        // OR nested { meta: { symbol, companyName }, data: [{ ltp, pChange }] }
+        const toEntry = (g: any): MoverEntry => {
+          const d    = Array.isArray(g.data) ? g.data[0] : g;
+          const meta = g.meta ?? g;
+          return {
+            symbol:         String(meta.symbol ?? g.symbol ?? '').toUpperCase(),
+            name:           String(meta.companyName ?? d.symbolName ?? g.symbolName ?? g.companyName ?? meta.symbol ?? ''),
+            ltp:            toNum(d.ltp ?? d.lastPrice ?? d.ltP ?? g.ltp ?? g.lastPrice ?? g.ltP ?? 0),
+            change_percent: toNum(d.pChange ?? d.perChange ?? g.pChange ?? g.perChange ?? 0),
+            change_abs:     toNum(d.netPrice ?? d.netChange ?? g.netPrice ?? g.netChange ?? 0),
+            volume:         toNum(d.tradedQuantity ?? d.totalTradedVolume ?? g.tradedQuantity ?? g.totalTradedVolume ?? 0),
+          };
+        };
+        topGainers = nseGainers.filter((g: any) => g.symbol || g.meta?.symbol).map(toEntry);
+        topLosers  = nseLosers.filter((g: any) => g.symbol || g.meta?.symbol).map(toEntry);
+      } catch { /* NSE gainers/losers endpoint unavailable */ }
+    }
+
+    // Layer 3: Sector indices fallback — always available when /allIndices works
+    if (!topGainers.length && indicesData.length) {
+      const validIdx = indicesData.filter((d: any) =>
+        d.last > 0 && d.percentChange !== undefined && d.index !== 'INDIA VIX'
+      );
+      const sortedIdx = [...validIdx].sort((a: any, b: any) => b.percentChange - a.percentChange);
+      const toIdxEntry = (d: any): MoverEntry => ({
+        symbol:         String(d.index ?? d.name ?? ''),
+        name:           String(d.index ?? d.name ?? ''),
+        ltp:            toNum(d.last),
+        change_percent: toNum(d.percentChange),
+        change_abs:     toNum(d.variation),
+        volume:         0,
+      });
+      topGainers = sortedIdx.filter((d: any) => d.percentChange > 0).slice(0, 8).map(toIdxEntry);
+      topLosers  = sortedIdx.filter((d: any) => d.percentChange < 0).slice(-8).reverse().map(toIdxEntry);
+    }
   }
 
-  // ── Step 5: Sector strength from NSE indices cache ───────────────
-  // These keys are written by nse.ts fetchNseIndices() — no direct call here
+  // ── Step 5: Sector strength ──────────────────────────────────────
+  // indicesData already fetched in Step 4a — reuse it here.
   const sectorStrength: SectorStrength[] = [];
-  const cachedIndices = await cacheGet<any>(NSE_INDICES_KEY);
-  const indicesData: any[] = cachedIndices?.data ?? [];
 
   if (indicesData.length) {
     for (const [indexName, sectorLabel] of Object.entries(SECTOR_INDEX_NAMES)) {
@@ -396,13 +499,13 @@ export async function computeMarketIntelligence(): Promise<MarketIntelligenceRes
       });
     }
   }
-  // Sort: leaders first, then laggards
   sectorStrength.sort((a, b) => b.change_percent - a.change_percent);
 
   // ── Step 6: FII/DII ─────────────────────────────────────────────
-  // Key nse:/fiidiiTradeReact written by nse.ts
+  // Primary: Redis cache. Fallback chain: MySQL macro_data → NSE direct.
   const cachedFii = await cacheGet<any>(NSE_FIIDII_KEY);
   let fiiDii: FiiDiiEntry[] = [];
+
   if (Array.isArray(cachedFii) && cachedFii.length) {
     fiiDii = normaliseFiiDii(cachedFii);
   } else {
@@ -421,18 +524,33 @@ export async function computeMarketIntelligence(): Promise<MarketIntelligenceRes
         const fiiNet = toNum(m.FII_NET ?? (m.FII_BUY ?? 0) - (m.FII_SELL ?? 0));
         const diiNet = toNum(m.DII_NET ?? (m.DII_BUY ?? 0) - (m.DII_SELL ?? 0));
         fiiDii = [{
-          date:      '',
-          fii_buy:   toNum(m.FII_BUY),
-          fii_sell:  toNum(m.FII_SELL),
-          fii_net:   fiiNet,
-          dii_buy:   toNum(m.DII_BUY),
-          dii_sell:  toNum(m.DII_SELL),
-          dii_net:   diiNet,
+          date: '', fii_buy: toNum(m.FII_BUY), fii_sell: toNum(m.FII_SELL), fii_net: fiiNet,
+          dii_buy: toNum(m.DII_BUY), dii_sell: toNum(m.DII_SELL), dii_net: diiNet,
           fii_label: fiiNet > 0 ? `FII net bought ₹${(Math.abs(fiiNet)/100).toFixed(0)} Cr` : `FII net sold ₹${(Math.abs(fiiNet)/100).toFixed(0)} Cr`,
           dii_label: diiNet > 0 ? `DII net bought ₹${(Math.abs(diiNet)/100).toFixed(0)} Cr` : `DII net sold ₹${(Math.abs(diiNet)/100).toFixed(0)} Cr`,
         }];
       }
-    } catch { /* FII data unavailable */ }
+    } catch { /* macro_data unavailable */ }
+
+    // NSE direct fallback — fetch FII/DII from NSE API if MySQL was also empty
+    if (!fiiDii.length) {
+      try {
+        const nseFii = await fetchFiiDii();
+        if (nseFii.length) {
+          fiiDii = nseFii.map(r => ({
+            date:      r.date,
+            fii_buy:   r.fii_buy, fii_sell: r.fii_sell, fii_net: r.fii_net,
+            dii_buy:   r.dii_buy, dii_sell: r.dii_sell, dii_net: r.dii_net,
+            fii_label: r.fii_net > 0
+              ? `FII net bought ₹${(Math.abs(r.fii_net)/100).toFixed(0)} Cr`
+              : `FII net sold ₹${(Math.abs(r.fii_net)/100).toFixed(0)} Cr`,
+            dii_label: r.dii_net > 0
+              ? `DII net bought ₹${(Math.abs(r.dii_net)/100).toFixed(0)} Cr`
+              : `DII net sold ₹${(Math.abs(r.dii_net)/100).toFixed(0)} Cr`,
+          }));
+        }
+      } catch { /* NSE FII unavailable */ }
+    }
   }
 
   // ── Step 7: Volatility ───────────────────────────────────────────
@@ -465,6 +583,20 @@ export async function computeMarketIntelligence(): Promise<MarketIntelligenceRes
     if (indicesData.length) {
       const vixIdx = indicesData.find((d: any) => d.index === 'INDIA VIX' || d.name === 'INDIA VIX');
       if (vixIdx) volatility.nifty_vix = toNum(vixIdx.last ?? vixIdx.lastPrice ?? null);
+
+      // avg_range fallback — derive from Nifty 500 index when no candle data
+      if (volatility.avg_range_pct === 0) {
+        const n500 = indicesData.find((d: any) => d.index === 'NIFTY 500' || d.name === 'NIFTY 500');
+        if (n500?.high && n500?.low && n500?.last) {
+          volatility.avg_range_pct = parseFloat(((n500.high - n500.low) / n500.last * 100).toFixed(2));
+          // Recompute label for the new value
+          const r = volatility.avg_range_pct;
+          volatility.volatility_label =
+            r > 4   ? 'Very High' :
+            r > 2.5 ? 'High'      :
+            r > 1   ? 'Normal'    : 'Low';
+        }
+      }
     }
   }
 
@@ -489,8 +621,12 @@ export async function computeMarketIntelligence(): Promise<MarketIntelligenceRes
     cache_age_sec:   cacheAgeSec,
   };
 
-  // Cache the computed result for 60s — reduces repeated DB/Redis fan-out
+  // Cache the computed result for 60s
+  // Redis: for cross-process sharing (scheduler → API routes)
+  // Memory: so scenario engine can read it in the same process/request cycle
   await cacheSet(INTEL_CACHE_KEY, result, INTEL_CACHE_TTL);
+  _memCache   = result;
+  _memCacheAt = Date.now();
 
   return result;
 }
