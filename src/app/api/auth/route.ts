@@ -6,7 +6,7 @@ import { getSession } from '@/lib/session';
 const COOKIE = 'q200_session';
 const COOKIE_OPTS = {
   httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
+  secure: false,
   sameSite: 'lax' as const,
   path: '/',
   maxAge: parseInt(process.env.SESSION_MAX_AGE || '86400'),
