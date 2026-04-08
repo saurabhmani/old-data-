@@ -178,8 +178,11 @@ export default function MarketDetail({ instrumentKey, symbol, exchange }: Props)
   const oi      = tick?.oi ?? null;
   const positive = (pctChg ?? 0) >= 0;
 
-  // Signal quick access
-  const sig     = signalData?.signal;
+  // Signal quick access — handles approved, rejected, and no-data states
+  const sig        = signalData?.signal;
+  const sigApproved = signalData?.approved === true;
+  const sigRejected = signalData != null && signalData.approved === false;
+  const hasSignalData = signalData != null;
   const conf    = signalData?.confidence_score ?? sig?.confidence ?? 0;
   const risk    = signalData?.risk_score ?? sig?.risk_score ?? 0;
   const fitScore = signalData?.portfolio_fit_score ?? sig?.portfolio_fit ?? 0;
@@ -198,7 +201,8 @@ export default function MarketDetail({ instrumentKey, symbol, exchange }: Props)
         fetch(`/api/instruments?key=${encodeURIComponent(instrumentKey)}`).then(r => r.json()),
         chartsApi.intraday(instrumentKey, '1minute'),
         fetch(`/api/nse?resource=quote&symbol=${encodeURIComponent(symbol)}`).then(r => r.json()),
-        fetch(`/api/signals?action=instrument&symbol=${encodeURIComponent(symbol)}`).then(r => r.json()),
+        fetch(`/api/signals?action=instrument&symbol=${encodeURIComponent(symbol)}`)
+          .then(r => r.ok ? r.json() : null),
       ]);
 
       if (iRes.status === 'fulfilled' && iRes.value?.instrument) setInst(iRes.value.instrument);
@@ -209,7 +213,9 @@ export default function MarketDetail({ instrumentKey, symbol, exchange }: Props)
         setQuote(qRes.value.quote);
         if (qRes.value.meta) setMeta(qRes.value.meta);
       }
-      if (sRes.status === 'fulfilled') setSignal(sRes.value);
+      if (sRes.status === 'fulfilled' && sRes.value && !sRes.value.error) {
+        setSignal(sRes.value);
+      }
 
       setLoading(false);
     }
@@ -304,11 +310,17 @@ export default function MarketDetail({ instrumentKey, symbol, exchange }: Props)
                 <span className={clsx(s.pill, s['pill--segment'])}>{inst.instrument_type}</span>
               )}
               {isFO && <span className={clsx(s.pill, s['pill--fo'])}>F&O</span>}
-              {sigDir && (
+              {sigDir && sigApproved && (
                 <span className={clsx(s.pill, s[`pill--${sigDir.toLowerCase()}`])}>{sigDir}</span>
+              )}
+              {sigRejected && (
+                <span className={clsx(s.pill, s['pill--hold'])}>REJECTED</span>
               )}
               {signalData?.scenario_tag && (
                 <span className={clsx(s.pill, s['pill--regime'])}>{signalData.scenario_tag}</span>
+              )}
+              {signalData?.market_stance && (
+                <span className={clsx(s.pill, s['pill--regime'])}>{signalData.market_stance}</span>
               )}
             </div>
             <span className={s.companyName}>
@@ -795,12 +807,22 @@ export default function MarketDetail({ instrumentKey, symbol, exchange }: Props)
           {/* Signal Intelligence */}
           <div className={s.dpCardTop}>
             <div className={s.dpSectionLabel}>Signal Intelligence</div>
-            {sig ? (
+            {sigApproved && sigDir ? (
+              <div className={clsx(s.dpVerdict, s[`dpVerdict--${sigDir}`])}>
+                {sigDir === 'BUY' ? <TrendingUp size={15} /> : sigDir === 'SELL' ? <TrendingDown size={15} /> : <Minus size={15} />}
+                {sigDir}
+              </div>
+            ) : sigRejected ? (
+              <div className={clsx(s.dpVerdict, s['dpVerdict--HOLD'])}>
+                <Shield size={15} /> Rejected
+              </div>
+            ) : (
+              <div className={clsx(s.dpVerdict, s['dpVerdict--none'])}>No Active Signal</div>
+            )}
+
+            {/* Show scores whenever we have signal data (approved or rejected) */}
+            {hasSignalData && (
               <>
-                <div className={clsx(s.dpVerdict, s[`dpVerdict--${sigDir}`])}>
-                  {sigDir === 'BUY' ? <TrendingUp size={15} /> : sigDir === 'SELL' ? <TrendingDown size={15} /> : <Minus size={15} />}
-                  {sigDir}
-                </div>
                 <div className={s.dpRow}>
                   <span className={s.dpRowL}>Confidence</span>
                   <span className={s.dpRowV}>
@@ -822,28 +844,51 @@ export default function MarketDetail({ instrumentKey, symbol, exchange }: Props)
                     {fitScore > 0 ? fitScore.toFixed(0) : '-'}
                   </span>
                 </div>
+                {signalData?.conviction_band && (
+                  <div className={s.dpRow}>
+                    <span className={s.dpRowL}>Conviction</span>
+                    <span className={s.dpRowV}>{signalData.conviction_band}</span>
+                  </div>
+                )}
+                {signalData?.scenario_tag && (
+                  <div className={s.dpRow}>
+                    <span className={s.dpRowL}>Scenario</span>
+                    <span className={s.dpRowV}>{signalData.scenario_tag}</span>
+                  </div>
+                )}
+                {signalData?.market_stance && (
+                  <div className={s.dpRow}>
+                    <span className={s.dpRowL}>Stance</span>
+                    <span className={s.dpRowV}>{signalData.market_stance}</span>
+                  </div>
+                )}
               </>
-            ) : (
-              <div className={clsx(s.dpVerdict, s['dpVerdict--none'])}>No Active Signal</div>
             )}
           </div>
 
           {/* Readiness */}
-          {sig && (
+          {hasSignalData && (
             <div className={s.dpCard}>
               <div className={s.dpSectionLabel}>Execution</div>
               <div className={clsx(
                 s.dpReadiness,
-                conf >= 65 ? s['dpReadiness--go'] : conf >= 45 ? s['dpReadiness--wait'] : s['dpReadiness--no']
+                sigApproved && conf >= 65 ? s['dpReadiness--go'] : conf >= 45 && sigApproved ? s['dpReadiness--wait'] : s['dpReadiness--no']
               )}>
-                {conf >= 65 ? <Check size={13} /> : conf >= 45 ? <AlertTriangle size={13} /> : <Shield size={13} />}
-                {conf >= 65 ? 'Ready' : conf >= 45 ? 'Caution' : 'Not Recommended'}
+                {sigApproved && conf >= 65 ? <Check size={13} /> : conf >= 45 && sigApproved ? <AlertTriangle size={13} /> : <Shield size={13} />}
+                {sigApproved && conf >= 65 ? 'Ready' : sigApproved && conf >= 45 ? 'Caution' : sigRejected ? 'Rejected by Engine' : 'Not Recommended'}
               </div>
+              {sigRejected && signalData?.rejection_reasons && signalData.rejection_reasons.length > 0 && (
+                <div style={{ marginTop: 8, fontSize: 11, color: '#64748B', lineHeight: 1.5 }}>
+                  {signalData.rejection_reasons.slice(0, 3).map((r, i) => (
+                    <div key={i}>• {r}</div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
           {/* Trade Plan */}
-          {sig && (
+          {sigApproved && sig && (
             <div className={s.dpCard}>
               <div className={s.dpSectionLabel}>Trade Plan</div>
               <div className={s.dpLevels}>
