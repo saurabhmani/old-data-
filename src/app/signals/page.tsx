@@ -3,134 +3,94 @@ import { useEffect, useState, useRef } from 'react';
 import AppShell from '@/components/layout/AppShell';
 import { Card, Badge, Loading } from '@/components/ui';
 import { fmt, changeClass } from '@/lib/utils';
-import { Zap, Search, TrendingUp, TrendingDown, Activity, Target, ChevronRight } from 'lucide-react';
+import {
+  Zap, Search, TrendingUp, TrendingDown, Activity, Target,
+  ChevronRight, RefreshCw, ArrowUpRight, ArrowDownRight, Minus,
+  Shield, AlertTriangle,
+} from 'lucide-react';
 import Link from 'next/link';
-import '@/styles/components/_intelligence.scss';
 
-// ── Signal classifier ─────────────────────────────────────────────
-interface LiveSignal {
-  symbol:      string;
-  ltp:         number;
-  change_pct:  number;
-  volume:      number;
-  week52_high: number;
-  week52_low:  number;
-  direction:   'BUY' | 'SELL' | 'WATCH';
-  strategy:    string;
-  confidence:  number;
-  reasons:     string[];
-  entry:       number;
-  stop:        number;
-  target:      number;
-  rr:          string;
-}
-
-function classifySignal(g: any, side: 'gainers' | 'losers'): LiveSignal {
-  const ltp  = Number(g.ltp ?? g.lastPrice ?? g.ltP ?? 0);
-  const pct  = Number(g.pChange ?? g.perChange ?? 0);
-  const vol  = Number(g.tradedQuantity ?? g.totalTradedVolume ?? g.volume ?? 0);
-  const y52h = Number(g.yearHigh  ?? g.week52High ?? 0);
-  const y52l = Number(g.yearLow   ?? g.week52Low  ?? 0);
-  const sym  = String(g.symbol ?? '').toUpperCase();
-
-  const w52pos   = y52h > y52l ? ((ltp - y52l) / (y52h - y52l)) * 100 : 50;
-  const atrProxy = ltp * 0.015;
-
-  const reasons: string[] = [];
-  let strategy  = 'MOMENTUM';
-  let confidence = 55;
-
-  if (side === 'gainers') {
-    if (pct >= 5)       { strategy = 'MOMENTUM_EXPANSION'; confidence = 72; reasons.push(`Strong up move: +${pct.toFixed(2)}%`); }
-    else if (pct >= 3)  { strategy = 'MOMENTUM_BUY';       confidence = 65; reasons.push(`Solid momentum: +${pct.toFixed(2)}%`); }
-    else                { strategy = 'TREND_CONTINUATION'; confidence = 58; reasons.push(`Positive move: +${pct.toFixed(2)}%`); }
-
-    if      (w52pos >= 90) { strategy = 'BREAKOUT'; confidence = Math.min(82, confidence + 10); reasons.push(`Near 52W high (${w52pos.toFixed(0)}th pct) — breakout zone`); }
-    else if (w52pos >= 75) { reasons.push(`Upper quartile of 52W range — bullish`); confidence += 5; }
-    else if (w52pos <= 40) { reasons.push(`Rising from lower half — accumulation`); }
-
-    if      (vol >= 1_000_000) { reasons.push(`High volume: ${fmt.volume(vol)} — institutional`); confidence += 5; }
-    else if (vol >= 100_000)   { reasons.push(`Above-avg volume confirms move`); confidence += 2; }
-    else if (vol < 50_000)     { reasons.push(`Light volume — may lack conviction`); confidence -= 5; }
-
-    const slDist = atrProxy * 1.5;
-    const t1Dist = slDist * 2.0;
-    return {
-      symbol: sym, ltp, change_pct: pct, volume: vol, week52_high: y52h, week52_low: y52l,
-      direction: 'BUY', strategy, confidence: Math.min(85, Math.max(50, confidence)),
-      reasons: reasons.slice(0, 3),
-      entry:  parseFloat(ltp.toFixed(2)),
-      stop:   parseFloat((ltp - slDist).toFixed(2)),
-      target: parseFloat((ltp + t1Dist).toFixed(2)),
-      rr: '1:2.0',
-    };
-  } else {
-    if      (Math.abs(pct) >= 5) { strategy = 'MOMENTUM_SELL'; confidence = 70; reasons.push(`Sharp decline: ${pct.toFixed(2)}%`); }
-    else if (Math.abs(pct) >= 3) { strategy = 'DOWNTREND';     confidence = 63; reasons.push(`Down move: ${pct.toFixed(2)}%`); }
-    else                         { strategy = 'WEAKNESS';      confidence = 56; reasons.push(`Negative: ${pct.toFixed(2)}%`); }
-
-    if      (w52pos <= 15) { strategy = 'OVERSOLD_WATCH'; confidence = Math.min(78, confidence + 8); reasons.push(`Near 52W low (${w52pos.toFixed(0)}th pct) — watch reversal`); }
-    else if (w52pos <= 30) { reasons.push(`Lower range — selling pressure`); }
-    else if (w52pos >= 70) { reasons.push(`Falling from highs — distribution`); confidence += 5; }
-
-    if      (vol >= 1_000_000) { reasons.push(`Heavy volume confirms selling`); confidence += 5; }
-    else if (vol < 50_000)     { reasons.push(`Low volume — may be noise`); confidence -= 5; }
-
-    const slDist = atrProxy * 1.5;
-    const t1Dist = slDist * 2.0;
-    return {
-      symbol: sym, ltp, change_pct: pct, volume: vol, week52_high: y52h, week52_low: y52l,
-      direction: strategy === 'OVERSOLD_WATCH' ? 'WATCH' : 'SELL',
-      strategy, confidence: Math.min(80, Math.max(50, confidence)),
-      reasons: reasons.slice(0, 3),
-      entry:  parseFloat(ltp.toFixed(2)),
-      stop:   parseFloat((ltp + slDist).toFixed(2)),
-      target: parseFloat((ltp - t1Dist).toFixed(2)),
-      rr: '1:2.0',
-    };
-  }
+// ── Types ─────────────────────────────────────────────────────────
+interface SignalRow {
+  id:                number;
+  tradingsymbol:     string;
+  exchange:          string;
+  direction:         string;
+  timeframe:         string;
+  confidence:        number;
+  confidence_score:  number;
+  conviction_band:   string | null;
+  risk_score:        number;
+  risk:              string;
+  opportunity_score: number;
+  entry_price:       number;
+  stop_loss:         number;
+  target1:           number;
+  target2:           number | null;
+  risk_reward:       number;
+  regime:            string;
+  market_stance:     string;
+  scenario_tag:      string;
+  factor_scores:     Record<string, number> | null;
+  ltp:               number | null;
+  pct_change:        number | null;
+  generated_at:      string;
 }
 
 // ── UI helpers ────────────────────────────────────────────────────
 const DIR_STYLE: Record<string, { bg: string; color: string }> = {
-  BUY:   { bg: '#F0FDF4', color: '#16A34A' },
-  SELL:  { bg: '#FEF2F2', color: '#DC2626' },
-  WATCH: { bg: '#FFFBEB', color: '#D97706' },
+  BUY:  { bg: '#F0FDF4', color: '#16A34A' },
+  SELL: { bg: '#FEF2F2', color: '#DC2626' },
+  HOLD: { bg: '#FFFBEB', color: '#D97706' },
 };
 
 function SignalChip({ dir }: { dir: string }) {
-  const s = DIR_STYLE[dir] ?? DIR_STYLE.WATCH;
+  const s = DIR_STYLE[dir] ?? DIR_STYLE.HOLD;
+  const Icon = dir === 'BUY' ? ArrowUpRight : dir === 'SELL' ? ArrowDownRight : Minus;
   return (
-    <span style={{ fontSize: 11, fontWeight: 800, background: s.bg, color: s.color,
-      padding: '3px 10px', borderRadius: 20, letterSpacing: 0.5 }}>{dir}</span>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4,
+      fontSize: 11, fontWeight: 800, background: s.bg, color: s.color,
+      padding: '3px 10px', borderRadius: 20 }}>
+      <Icon size={12} /> {dir}
+    </span>
   );
 }
 
 function ConfBar({ value }: { value: number }) {
-  const col = value >= 70 ? '#16A34A' : value >= 58 ? '#D97706' : '#DC2626';
+  const col = value >= 75 ? '#065F46' : value >= 65 ? '#1D4ED8' : value >= 55 ? '#D97706' : '#DC2626';
   return (
-    <div style={{ width: 70 }}>
-      <div style={{ height: 5, background: '#E2E8F0', borderRadius: 99, overflow: 'hidden' }}>
-        <div style={{ height: '100%', width: `${value}%`, background: col, borderRadius: 99, transition: 'width 0.5s' }} />
+    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+      <div style={{ width: 50, height: 5, background: '#E2E8F0', borderRadius: 99, overflow: 'hidden' }}>
+        <div style={{ height: '100%', width: `${value}%`, background: col, borderRadius: 99 }} />
       </div>
-      <div style={{ fontSize: 10, color: '#64748B', marginTop: 2, textAlign: 'right' }}>{value}%</div>
+      <span style={{ fontSize: 11, fontWeight: 600, color: col }}>{value}%</span>
     </div>
   );
 }
 
-function W52Bar({ pos }: { pos: number }) {
-  const col = pos >= 75 ? '#16A34A' : pos <= 25 ? '#DC2626' : '#94A3B8';
+function ConvictionBadge({ band }: { band: string | null }) {
+  if (!band || band === 'reject') return <span style={{ color: '#CBD5E1', fontSize: 11 }}>—</span>;
+  const map: Record<string, [string, string, string]> = {
+    high_conviction: ['#D1FAE5', '#065F46', '●●●●'],
+    actionable:      ['#DBEAFE', '#1D4ED8', '●●●○'],
+    watchlist:       ['#FEF3C7', '#92400E', '●●○○'],
+  };
+  const cfg = map[band];
+  if (!cfg) return null;
+  return <span style={{ background: cfg[0], color: cfg[1], fontSize: 9, fontWeight: 700, padding: '2px 7px', borderRadius: 99 }}>{cfg[2]} {band.replace(/_/g, ' ')}</span>;
+}
+
+function ScenarioTag({ tag }: { tag: string | null }) {
+  if (!tag) return null;
   return (
-    <div style={{ width: 60 }}>
-      <div style={{ height: 4, background: '#E2E8F0', borderRadius: 99, overflow: 'hidden' }}>
-        <div style={{ height: '100%', width: `${pos}%`, background: col, borderRadius: 99 }} />
-      </div>
-      <div style={{ fontSize: 9, color: '#94A3B8', marginTop: 1 }}>{pos.toFixed(0)}th pct</div>
-    </div>
+    <span style={{ fontSize: 10, background: '#EFF6FF', color: '#1D4ED8',
+      padding: '1px 7px', borderRadius: 99, fontWeight: 600 }}>
+      {tag.replace(/_/g, ' ')}
+    </span>
   );
 }
 
-// ── Deep search panel ─────────────────────────────────────────────
+// ── Deep search result ────────────────────────────────────────────
 function SearchResult({ data, symbol }: { data: any; symbol: string }) {
   if (!data) return null;
   const approved = data.approved ?? false;
@@ -142,7 +102,7 @@ function SearchResult({ data, symbol }: { data: any; symbol: string }) {
         <span style={{ fontSize: 18, fontWeight: 800, color: '#1E3A5F' }}>{symbol}</span>
         {sig && <SignalChip dir={sig.direction} />}
         {sig?.risk && (
-          <Badge variant={sig.risk === 'High' ? 'red' : sig.risk === 'Low' ? 'green' : 'orange'}>
+          <Badge variant={sig.risk === 'High' || sig.risk === 'Very High' ? 'red' : sig.risk === 'Low' ? 'green' : 'orange'}>
             {sig.risk} Risk
           </Badge>
         )}
@@ -154,18 +114,18 @@ function SearchResult({ data, symbol }: { data: any; symbol: string }) {
 
       {approved && sig && (
         <>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8, marginBottom: 12 }}>
-            {[['Entry', sig.entry_price], ['Stop Loss', sig.stop_loss], ['Target', sig.target1]].map(([l, v]) => (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, marginBottom: 12 }}>
+            {[['Entry', sig.entry_price], ['Stop Loss', sig.stop_loss], ['Target', sig.target1], ['R:R', `1:${sig.risk_reward}`]].map(([l, v]) => (
               <div key={String(l)} style={{ background: '#fff', borderRadius: 8, padding: '10px 14px', border: '1px solid #E2E8F0', textAlign: 'center' }}>
                 <div style={{ fontSize: 11, color: '#94A3B8', fontWeight: 600, marginBottom: 2 }}>{l}</div>
-                <div style={{ fontSize: 15, fontWeight: 700 }}>{fmt.currency(v as number)}</div>
+                <div style={{ fontSize: 15, fontWeight: 700 }}>{typeof v === 'number' ? fmt.currency(v) : v}</div>
               </div>
             ))}
           </div>
           <div style={{ display: 'flex', gap: 16, marginBottom: 10, fontSize: 12, color: '#64748B', flexWrap: 'wrap' }}>
-            {sig.confidence   && <span>Confidence: <strong style={{ color: '#0F172A' }}>{sig.confidence}%</strong></span>}
-            {sig.risk_reward  && <span>R:R <strong>1:{sig.risk_reward}</strong></span>}
-            {sig.scenario_tag && <span>Scenario: <strong>{sig.scenario_tag?.replace(/_/g, ' ')}</strong></span>}
+            {sig.confidence != null && <span>Confidence: <strong style={{ color: '#0F172A' }}>{sig.confidence}%</strong></span>}
+            {sig.scenario_tag && <span>Strategy: <strong>{sig.scenario_tag.replace(/_/g, ' ')}</strong></span>}
+            {sig.regime && <span>Regime: <strong>{sig.regime}</strong></span>}
           </div>
         </>
       )}
@@ -190,7 +150,7 @@ function SearchResult({ data, symbol }: { data: any; symbol: string }) {
               {Object.entries(fs).map(([k, v]) => (
                 <div key={k} style={{ textAlign: 'center' }}>
                   <div style={{ fontSize: 9, color: '#94A3B8', fontWeight: 600, marginBottom: 2, textTransform: 'uppercase' }}>
-                    {k.replace(/_/g, ' ').slice(0, 10)}
+                    {k.replace(/_/g, ' ').slice(0, 12)}
                   </div>
                   <div style={{ fontSize: 14, fontWeight: 700,
                     color: Number(v) >= 65 ? '#16A34A' : Number(v) >= 45 ? '#D97706' : '#DC2626' }}>
@@ -214,31 +174,35 @@ function SearchResult({ data, symbol }: { data: any; symbol: string }) {
 
 // ════════════════════════════════════════════════════════════════
 export default function SignalsPage() {
-  const [gainers,   setGainers]  = useState<LiveSignal[]>([]);
-  const [losers,    setLosers]   = useState<LiveSignal[]>([]);
-  const [loading,   setLoading]  = useState(true);
-  const [tab,       setTab]      = useState<'BUY' | 'SELL'>('BUY');
-  const [query,     setQuery]    = useState('');
-  const [srResult,  setSrResult] = useState<any>(null);
-  const [srLoading, setSrLoad]   = useState(false);
+  const [signals,  setSignals]  = useState<SignalRow[]>([]);
+  const [loading,  setLoading]  = useState(true);
+  const [tab,      setTab]      = useState<'ALL' | 'BUY' | 'SELL'>('ALL');
+  const [query,    setQuery]    = useState('');
+  const [srResult, setSrResult] = useState<any>(null);
+  const [srLoading, setSrLoad]  = useState(false);
+  const [pipelineRunning, setPipelineRunning] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout>>();
 
-  useEffect(() => {
-    setLoading(true);
-    Promise.allSettled([
-      fetch('/api/nse?resource=gainers').then(r => r.json()),
-      fetch('/api/nse?resource=losers').then(r => r.json()),
-    ]).then(([gRes, lRes]) => {
-      if (gRes.status === 'fulfilled') {
-        const raw = gRes.value.gainers ?? [];
-        setGainers(raw.map((g: any) => classifySignal(g, 'gainers')).filter((s: LiveSignal) => s.symbol));
-      }
-      if (lRes.status === 'fulfilled') {
-        const raw = lRes.value.losers ?? [];
-        setLosers(raw.map((g: any) => classifySignal(g, 'losers')).filter((s: LiveSignal) => s.symbol));
-      }
-    }).finally(() => setLoading(false));
-  }, []);
+  const load = async (spinner = true) => {
+    if (spinner) setLoading(true);
+    try {
+      const res = await fetch('/api/signals?action=all&limit=50');
+      const data = await res.json();
+      setSignals(data.signals ?? []);
+    } catch {}
+    finally { if (spinner) setLoading(false); }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const runPipeline = async () => {
+    setPipelineRunning(true);
+    try {
+      await fetch('/api/run-signal-engine', { method: 'POST' });
+      await load(false);
+    } catch {}
+    finally { setPipelineRunning(false); }
+  };
 
   const handleSearch = (q: string) => {
     setQuery(q);
@@ -255,7 +219,9 @@ export default function SignalsPage() {
     }, 600);
   };
 
-  const shown = tab === 'BUY' ? gainers : losers;
+  const buySignals  = signals.filter(s => s.direction === 'BUY');
+  const sellSignals = signals.filter(s => s.direction === 'SELL');
+  const shown = tab === 'BUY' ? buySignals : tab === 'SELL' ? sellSignals : signals;
 
   return (
     <AppShell title="Signal Engine">
@@ -266,18 +232,27 @@ export default function SignalsPage() {
               <Zap size={22} color="#2E75B6" /> Signal Engine
             </h1>
             <p style={{ color: '#64748B', fontSize: 14, marginTop: 4 }}>
-              Live momentum · Breakout · Mean-reversion signals from NSE
+              All signals from centralized pipeline — BUY/SELL with full analysis
             </p>
           </div>
-          <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
             <div style={{ textAlign: 'center', background: '#F0FDF4', borderRadius: 8, padding: '8px 16px' }}>
-              <div style={{ fontSize: 20, fontWeight: 800, color: '#16A34A' }}>{gainers.length}</div>
+              <div style={{ fontSize: 20, fontWeight: 800, color: '#16A34A' }}>{buySignals.length}</div>
               <div style={{ fontSize: 11, color: '#94A3B8', fontWeight: 600 }}>BUY</div>
             </div>
             <div style={{ textAlign: 'center', background: '#FEF2F2', borderRadius: 8, padding: '8px 16px' }}>
-              <div style={{ fontSize: 20, fontWeight: 800, color: '#DC2626' }}>{losers.length}</div>
-              <div style={{ fontSize: 11, color: '#94A3B8', fontWeight: 600 }}>SELL/WATCH</div>
+              <div style={{ fontSize: 20, fontWeight: 800, color: '#DC2626' }}>{sellSignals.length}</div>
+              <div style={{ fontSize: 11, color: '#94A3B8', fontWeight: 600 }}>SELL</div>
             </div>
+            <button
+              className="btn btn--primary btn--sm"
+              onClick={runPipeline}
+              disabled={pipelineRunning}
+              style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+            >
+              <RefreshCw size={13} className={pipelineRunning ? 'spin' : ''} />
+              {pipelineRunning ? 'Running…' : 'Run Pipeline'}
+            </button>
           </div>
         </div>
 
@@ -294,7 +269,7 @@ export default function SignalsPage() {
             />
           </div>
           <div style={{ fontSize: 11, color: '#94A3B8', paddingLeft: 26 }}>
-            Runs full signal engine — factor scoring, confidence, R:R levels, rejection analysis
+            Runs full signal engine live — factor scoring, confidence, R:R levels, rejection analysis
           </div>
           {srLoading && (
             <div style={{ marginTop: 12, fontSize: 13, color: '#64748B', display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -305,114 +280,107 @@ export default function SignalsPage() {
         </Card>
 
         {/* ── Tab selector ── */}
-        <div style={{ display: 'flex', gap: 8, marginBottom: 16, alignItems: 'center' }}>
-          <button
-            className={`btn btn--sm ${tab === 'BUY' ? 'btn--primary' : 'btn--secondary'}`}
-            onClick={() => setTab('BUY')}
-            style={{ display: 'flex', alignItems: 'center', gap: 6 }}
-          >
-            <TrendingUp size={13} /> BUY Signals ({gainers.length})
-          </button>
-          <button
-            className={`btn btn--sm ${tab === 'SELL' ? 'btn--primary' : 'btn--secondary'}`}
-            onClick={() => setTab('SELL')}
-            style={{ display: 'flex', alignItems: 'center', gap: 6 }}
-          >
-            <TrendingDown size={13} /> SELL / WATCH ({losers.length})
-          </button>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+          {(['ALL', 'BUY', 'SELL'] as const).map(t => (
+            <button key={t}
+              className={`btn btn--sm ${tab === t ? 'btn--primary' : 'btn--secondary'}`}
+              onClick={() => setTab(t)}
+              style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+            >
+              {t === 'BUY' && <TrendingUp size={13} />}
+              {t === 'SELL' && <TrendingDown size={13} />}
+              {t} ({t === 'ALL' ? signals.length : t === 'BUY' ? buySignals.length : sellSignals.length})
+            </button>
+          ))}
         </div>
 
         {/* ── Signal table ── */}
         <Card flush>
           {loading ? (
-            <div style={{ padding: 32 }}><Loading text="Fetching live NSE signals…" /></div>
+            <div style={{ padding: 32 }}><Loading text="Loading signals from database…" /></div>
           ) : shown.length === 0 ? (
             <div style={{ padding: 32, textAlign: 'center', color: '#94A3B8' }}>
               <Zap size={32} style={{ marginBottom: 12, opacity: 0.3 }} />
-              <div style={{ fontWeight: 600, marginBottom: 4 }}>No signals</div>
-              <div style={{ fontSize: 13 }}>Markets may be closed or NSE data is unavailable</div>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>No signals in database</div>
+              <div style={{ fontSize: 13, marginBottom: 12 }}>Click "Run Pipeline" to generate fresh signals</div>
+              <button className="btn btn--primary btn--sm" onClick={runPipeline} disabled={pipelineRunning}>
+                <Zap size={13} /> Generate Signals
+              </button>
             </div>
           ) : (
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
                   <tr style={{ background: '#F8FAFC' }}>
-                    {['#', 'Symbol', 'Signal', 'Strategy', 'Conf', 'LTP', 'Change', 'Entry', 'Stop', 'Target', 'R:R', '52W Pos', 'Volume', ''].map(h => (
+                    {['#', 'Symbol', 'Direction', 'Strategy', 'Confidence', 'Entry', 'Stop Loss', 'Target', 'R:R', 'Opp Score', 'Conviction', ''].map(h => (
                       <th key={h} style={{
                         padding: '9px 12px',
-                        textAlign: h === 'LTP' || h === 'Entry' || h === 'Stop' || h === 'Target' ? 'right' : 'left',
-                        fontSize: 10, color: '#94A3B8', fontWeight: 700, letterSpacing: 0.3, whiteSpace: 'nowrap',
+                        textAlign: ['Entry', 'Stop Loss', 'Target', 'R:R', 'Opp Score'].includes(h) ? 'right' : 'left',
+                        fontSize: 10, color: '#94A3B8', fontWeight: 700, whiteSpace: 'nowrap',
                       }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {shown.map((s, i) => {
-                    const w52pos = s.week52_high > s.week52_low
-                      ? ((s.ltp - s.week52_low) / (s.week52_high - s.week52_low)) * 100 : 50;
-                    return (
-                      <tr key={s.symbol + i} style={{ borderTop: '1px solid #F1F5F9' }}>
-                        <td style={{ padding: '10px 12px', fontSize: 11, color: '#94A3B8', fontWeight: 600 }}>
-                          {i + 1}
-                        </td>
-                        <td style={{ padding: '10px 12px' }}>
-                          <Link href={`/market/NSE_EQ|${s.symbol}`}
-                            style={{ fontWeight: 800, color: '#1E3A5F', textDecoration: 'none' }}>
-                            {s.symbol}
-                          </Link>
-                        </td>
-                        <td style={{ padding: '10px 12px' }}>
-                          <SignalChip dir={s.direction} />
-                        </td>
-                        <td style={{ padding: '10px 12px', fontSize: 11, color: '#64748B', maxWidth: 120 }}>
-                          {s.strategy.replace(/_/g, ' ')}
-                        </td>
-                        <td style={{ padding: '10px 12px' }}>
-                          <ConfBar value={s.confidence} />
-                        </td>
-                        <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 700, color: '#0F172A' }}>
-                          {fmt.currency(s.ltp)}
-                        </td>
-                        <td style={{ padding: '10px 12px' }}>
-                          <span style={{ fontSize: 12, fontWeight: 700 }} className={changeClass(s.change_pct)}>
-                            {s.change_pct >= 0 ? '+' : ''}{s.change_pct.toFixed(2)}%
-                          </span>
-                        </td>
-                        <td style={{ padding: '10px 12px', textAlign: 'right', color: '#0F172A' }}>
-                          {fmt.currency(s.entry)}
-                        </td>
-                        <td style={{ padding: '10px 12px', textAlign: 'right', color: '#DC2626' }}>
-                          {fmt.currency(s.stop)}
-                        </td>
-                        <td style={{ padding: '10px 12px', textAlign: 'right', color: '#16A34A' }}>
-                          {fmt.currency(s.target)}
-                        </td>
-                        <td style={{ padding: '10px 12px', fontSize: 12, color: '#64748B' }}>{s.rr}</td>
-                        <td style={{ padding: '10px 12px' }}>
-                          <W52Bar pos={w52pos} />
-                        </td>
-                        <td style={{ padding: '10px 12px', fontSize: 12, color: '#64748B' }}>
-                          {fmt.volume(s.volume)}
-                        </td>
-                        <td style={{ padding: '10px 12px' }}>
-                          <Link href={`/market/NSE_EQ|${s.symbol}`}
-                            style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 11, color: '#2E75B6', textDecoration: 'none' }}>
-                            <Target size={11} /> Chart <ChevronRight size={10} />
-                          </Link>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  {shown.map((s, i) => (
+                    <tr key={s.id ?? `${s.tradingsymbol}-${i}`}
+                      style={{ borderTop: '1px solid #F1F5F9',
+                        background: s.direction === 'BUY' ? '#FAFFFE' : s.direction === 'SELL' ? '#FFFAFA' : '#fff' }}>
+                      <td style={{ padding: '10px 12px', fontSize: 11, color: '#94A3B8', fontWeight: 600 }}>{i + 1}</td>
+                      <td style={{ padding: '10px 12px' }}>
+                        <Link href={`/market/NSE_EQ|${s.tradingsymbol}`}
+                          style={{ fontWeight: 800, color: '#1E3A5F', textDecoration: 'none' }}>
+                          {s.tradingsymbol}
+                        </Link>
+                        <div style={{ fontSize: 10, color: '#94A3B8' }}>{s.exchange}</div>
+                      </td>
+                      <td style={{ padding: '10px 12px' }}>
+                        <SignalChip dir={s.direction} />
+                      </td>
+                      <td style={{ padding: '10px 12px' }}>
+                        <ScenarioTag tag={s.scenario_tag} />
+                      </td>
+                      <td style={{ padding: '10px 12px' }}>
+                        <ConfBar value={s.confidence_score ?? s.confidence} />
+                      </td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 700 }}>
+                        {s.entry_price ? fmt.currency(s.entry_price) : '—'}
+                      </td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right', color: '#DC2626', fontWeight: 600 }}>
+                        {s.stop_loss ? fmt.currency(s.stop_loss) : '—'}
+                      </td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right', color: '#15803D', fontWeight: 600 }}>
+                        {s.target1 ? fmt.currency(s.target1) : '—'}
+                      </td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 600 }}>
+                        {s.risk_reward ? `1:${s.risk_reward}` : '—'}
+                      </td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right' }}>
+                        <span style={{ fontWeight: 700, fontSize: 13,
+                          color: s.opportunity_score >= 80 ? '#065F46' : s.opportunity_score >= 60 ? '#1D4ED8' : '#D97706' }}>
+                          {s.opportunity_score}
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px 12px' }}>
+                        <ConvictionBadge band={s.conviction_band} />
+                      </td>
+                      <td style={{ padding: '10px 12px' }}>
+                        <Link href={`/market/NSE_EQ|${s.tradingsymbol}`}
+                          style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 11, color: '#2E75B6', textDecoration: 'none' }}>
+                          <Target size={11} /> Chart <ChevronRight size={10} />
+                        </Link>
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
           )}
         </Card>
 
-        {/* ── Disclaimer ── */}
         <div style={{ marginTop: 16, fontSize: 11, color: '#94A3B8', textAlign: 'center' }}>
-          Signals based on live NSE data (price momentum, volume, 52-week positioning).
-          Stop/Target computed using 1.5% ATR proxy. Not investment advice.
+          Signals generated by centralized pipeline. Run Pipeline to refresh.
+          Not investment advice.
         </div>
       </div>
     </AppShell>

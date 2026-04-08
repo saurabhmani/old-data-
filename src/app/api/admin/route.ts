@@ -31,7 +31,7 @@ export const revalidate = 0;
 
 async function checkAdmin(req: NextRequest) {
   const user = await requireSession();
-  if (!(user as any).is_admin) throw new Error('Admin required');
+  if ((user as any).role !== 'admin') throw new Error('Admin required');
   return user;
 }
 

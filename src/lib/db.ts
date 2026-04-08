@@ -132,7 +132,7 @@ export const db = {
   query: async <T = any>(text: string, params?: any[]): Promise<{ rows: T[] }> => {
     const p = getDb();
 
-    if (/INSERT\s+INTO.*RETURNING/i.test(text)) {
+    if (/INSERT\s+INTO[\s\S]*RETURNING/i.test(text)) {
       return handleReturning(p, text, params || []) as Promise<{ rows: T[] }>;
     }
 

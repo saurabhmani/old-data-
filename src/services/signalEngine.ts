@@ -300,6 +300,7 @@ function computeFactors(f: Features): FactorScores {
 function selectStrategy(f: FactorScores, feat: Features, regime: string) {
   const candidates: Array<{tag: ScenarioTag; score: number; direction: SignalDirection}> = [];
 
+  // ── BUY candidates ──
   if (f.trend_quality>=65&&f.momentum>=60&&regime!=='BEAR'&&regime!=='STRONG_BEAR')
     candidates.push({tag:'TREND_CONTINUATION',score:(f.trend_quality+f.momentum)/2,direction:'BUY'});
   if (f.breakout_readiness>=65&&f.liquidity>=55)
@@ -314,10 +315,55 @@ function selectStrategy(f: FactorScores, feat: Features, regime: string) {
     candidates.push({tag:'RELATIVE_STRENGTH_LEADER',score:f.relative_strength*0.7+f.trend_quality*0.3,direction:'BUY'});
   if (f.volatility>=65&&feat.vol_compression!=null&&feat.vol_compression<0.7)
     candidates.push({tag:'VOLATILITY_COMPRESSION',score:f.volatility,direction:'BUY'});
-  if ((regime==='BEAR'||regime==='STRONG_BEAR')&&f.momentum<=35&&f.trend_quality<=40)
-    candidates.push({tag:'TREND_CONTINUATION',score:(100-f.momentum+100-f.trend_quality)/2,direction:'SELL'});
 
-  if (!candidates.length) return {tag:'NO_STRATEGY' as ScenarioTag,score:0,direction:'HOLD' as SignalDirection};
+  // ── SELL candidates ──
+  // Price-action bearish: stock is falling today — strongest SELL signal
+  if (feat.change_pct_1d <= -0.5)
+    candidates.push({tag:'TREND_CONTINUATION',score:Math.round(Math.min(100, 50 + Math.abs(feat.change_pct_1d)*10 + (100-f.momentum)*0.3)),direction:'SELL'});
+  // Bearish trend: weak momentum OR weak trend in any non-bull regime
+  if ((f.momentum<=45||f.trend_quality<=45)&&regime!=='BULL'&&regime!=='STRONG_BULL')
+    candidates.push({tag:'TREND_CONTINUATION',score:(100-f.momentum+100-f.trend_quality)/2,direction:'SELL'});
+  // Overbought mean reversion: RSI stretched high
+  if (feat.rsi_14!=null&&feat.rsi_14>=65)
+    candidates.push({tag:'MEAN_REVERSION',score:Math.round(feat.rsi_14*0.6+(100-f.momentum)*0.4),direction:'SELL'});
+  // Breakdown: near 52-week low with weak relative strength
+  if (f.relative_strength<=35&&feat.week52_position!=null&&feat.week52_position<=30)
+    candidates.push({tag:'BREAKOUT_CONTINUATION',score:(100-f.relative_strength+100-f.trend_quality)/2,direction:'SELL'});
+  // Momentum collapse: dropping momentum with low participation
+  if (f.momentum<=40&&f.participation<=50)
+    candidates.push({tag:'MOMENTUM_EXPANSION',score:(100-f.momentum+100-f.participation)/2,direction:'SELL'});
+  // Weak relative strength in non-bull regime
+  if (f.relative_strength<=40&&regime!=='BULL'&&regime!=='STRONG_BULL')
+    candidates.push({tag:'RELATIVE_STRENGTH_LEADER',score:(100-f.relative_strength)*0.7+(100-f.trend_quality)*0.3,direction:'SELL'});
+
+  // When price is falling, always prefer SELL candidates over BUY
+  if (candidates.length > 0 && feat.change_pct_1d <= -0.3) {
+    const sellCandidates = candidates.filter(c => c.direction === 'SELL');
+    if (sellCandidates.length > 0) {
+      return sellCandidates.sort((a, b) => b.score - a.score)[0];
+    }
+  }
+
+  if (!candidates.length) {
+    // Fallback: infer direction from live price action when historical data is insufficient
+    if (feat.change_pct_1d >= 2 && f.momentum >= 50)
+      return {tag:'MOMENTUM_EXPANSION' as ScenarioTag, score: f.momentum, direction:'BUY' as SignalDirection};
+    if (feat.change_pct_1d >= 0.5 && f.momentum >= 45)
+      return {tag:'WATCHLIST_OPPORTUNITY' as ScenarioTag, score: Math.max(f.momentum, f.relative_strength), direction:'BUY' as SignalDirection};
+    if (feat.change_pct_1d <= -2 && f.momentum <= 45)
+      return {tag:'TREND_CONTINUATION' as ScenarioTag, score: 100 - f.momentum, direction:'SELL' as SignalDirection};
+    if (feat.change_pct_1d <= -0.5)
+      return {tag:'WATCHLIST_OPPORTUNITY' as ScenarioTag, score: Math.max(100 - f.momentum, f.mean_reversion), direction:'SELL' as SignalDirection};
+    // Overbought/weak stocks even on green days
+    if (feat.rsi_14 != null && feat.rsi_14 >= 70)
+      return {tag:'MEAN_REVERSION' as ScenarioTag, score: Math.round(feat.rsi_14 * 0.6 + (100 - f.momentum) * 0.4), direction:'SELL' as SignalDirection};
+    if (f.momentum <= 35 && f.trend_quality <= 40)
+      return {tag:'TREND_CONTINUATION' as ScenarioTag, score: (100 - f.momentum + 100 - f.trend_quality) / 2, direction:'SELL' as SignalDirection};
+    // Assign direction based on overall factor weakness
+    if (f.momentum <= 45)
+      return {tag:'WATCHLIST_OPPORTUNITY' as ScenarioTag, score: 100 - f.momentum, direction:'SELL' as SignalDirection};
+    return {tag:'NO_STRATEGY' as ScenarioTag, score:0, direction:'HOLD' as SignalDirection};
+  }
   return candidates.sort((a,b)=>b.score-a.score)[0];
 }
 
@@ -613,8 +659,16 @@ export async function generateSignalsForWatchlist(
     );
     for (const sig of sigs) { if (sig) results.push(sig); }
   }
-  return results
-    .filter(s => s.rejection_reasons.length === 0)
+  // Deduplicate by tradingsymbol — keep the highest opportunity score
+  const bySymbol = new Map<string, Signal>();
+  for (const s of results) {
+    if (s.rejection_reasons.length > 0) continue;
+    const existing = bySymbol.get(s.tradingsymbol);
+    if (!existing || s.opportunity_score > existing.opportunity_score) {
+      bySymbol.set(s.tradingsymbol, s);
+    }
+  }
+  return Array.from(bySymbol.values())
     .sort((a,b) => b.opportunity_score - a.opportunity_score);
 }
 
