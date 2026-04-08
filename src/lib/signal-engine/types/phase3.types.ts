@@ -185,6 +185,11 @@ export interface ExecutableSignal {
   riskBreakdown: Phase3RiskBreakdown;
   lifecycle: SignalLifecycle;
 
+  // Carried from Phase 1/2 for Phase 4 explanation engine
+  features?: import('../types/signalEngine.types').SignalFeatures;
+  confidenceBreakdown?: import('../types/signalEngine.types').ConfidenceBreakdown;
+  standaloneRisk?: import('../types/signalEngine.types').RiskBreakdown;
+
   reasons: string[];
   warnings: string[];
   generatedAt: string;

@@ -8,6 +8,7 @@ import {
   Shield, Zap, Target, TrendingUp, TrendingDown,
   ChevronDown, ChevronRight, AlertTriangle, Info,
 } from 'lucide-react';
+import ConvictionGrid from '@/components/intelligence/ConvictionGrid';
 
 // ── Types ─────────────────────────────────────────────────────────
 interface SignalReason {
@@ -531,32 +532,32 @@ export default function IntelligencePage() {
               ))}
             </div>
 
-            {/* ── Row 3: Conviction Distribution Bar ── */}
-            <Card title="Conviction Distribution">
-              <div style={{ display: 'grid', gap: 8 }}>
-                {[
-                  { key: 'high_conviction', label: 'High Conviction (85-100)', color: '#065F46', bg: '#D1FAE5' },
-                  { key: 'actionable',      label: 'Actionable (70-84)',       color: '#1D4ED8', bg: '#DBEAFE' },
-                  { key: 'watchlist',        label: 'Watchlist (55-69)',        color: '#92400E', bg: '#FEF3C7' },
-                  { key: 'reject',           label: 'Ignore (<55)',            color: '#DC2626', bg: '#FEE2E2' },
-                ].map(({ key, label, color }) => {
-                  const count = convDist[key] ?? 0;
-                  const pct = Math.round(count / totalForDist * 100);
-                  return (
-                    <div key={key}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
-                        <span style={{ fontSize: 11, fontWeight: 600, color }}>{label}</span>
-                        <span style={{ fontSize: 11, color: '#64748B' }}>{count} ({pct}%)</span>
-                      </div>
-                      <div style={{ height: 5, background: '#E2E8F0', borderRadius: 99, overflow: 'hidden' }}>
-                        <div style={{ height: '100%', width: `${pct}%`, background: color,
-                          borderRadius: 99, transition: 'width 0.5s' }} />
-                      </div>
-                    </div>
-                  );
-                })}
+            {/* ── Row 3: Conviction Distribution Grid (Slider) ── */}
+            <div>
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                marginBottom: 12, paddingBottom: 10,
+                borderBottom: '2px solid #CFFAFE',
+              }}>
+                <Target size={14} style={{ color: '#06B6D4', flexShrink: 0 }} />
+                <span style={{
+                  fontSize: 15, fontWeight: 700,
+                  background: 'linear-gradient(135deg, #2563EB, #06B6D4)',
+                  WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
+                }}>
+                  Conviction Distribution
+                </span>
               </div>
-            </Card>
+              <ConvictionGrid
+                convictionDistribution={convDist}
+                signals={[
+                  ...Object.values(buyGroups).flat(),
+                  ...Object.values(sellGroups).flat(),
+                ]}
+                total={summary.total}
+                loading={loading}
+              />
+            </div>
 
             {/* ── Row 4: BUY & SELL Strategy-Grouped Signals (2 columns) ── */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, alignItems: 'start' }}>

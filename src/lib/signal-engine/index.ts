@@ -8,10 +8,15 @@ export type { CandleProvider, PipelineResult } from './pipeline/generatePhase1Si
 
 // Phase 2
 export { generatePhase2Signals } from './pipeline/generatePhase2Signals';
-export type { Phase2Result } from './pipeline/generatePhase2Signals';
+// Phase2PipelineResult exported from types below
 export { runAllStrategies } from './strategy-engine/runStrategies';
-export { computeRelativeStrength, defaultRelativeStrength } from './context/relativeStrength';
+export { computeRelativeStrength, defaultRelativeStrength, computeEnhancedRelativeStrength } from './context/relativeStrength';
 export { detectEnhancedRegime } from './regime/detectMarketRegime';
+export { resolveConflicts } from './strategy-engine/resolveConflicts';
+export { STRATEGY_REGISTRY, isStrategyAllowedInRegime, getStrategiesForRegime } from './strategies/strategyRegistry';
+export { buildSectorContextFromStock, defaultSectorContext } from './context/sectorContext';
+export { scoreForStrategy } from './scoring/strategyScorers';
+export { saveStrategyBreakdowns, saveConflictResolution, migratePhase2Tables } from './repository/saveStrategyBreakdowns';
 
 // Phase 3
 export { generatePhase3Signals } from './pipeline/generatePhase3Signals';
@@ -22,6 +27,8 @@ export { evaluateExecutionReadiness } from './execution/executionReadiness';
 export { computePhase3Risk } from './risk/phase3Risk';
 export { createLifecycle, transitionLifecycle, resolveInitialState, isExpired } from './lifecycle/signalLifecycle';
 export { DEFAULT_PHASE3_CONFIG, getSector } from './constants/phase3.constants';
+export { buildPhase3TradePlanForStrategy } from './trade-plan/buildTradePlan';
+export { pearsonCorrelation, buildCorrelationMatrix, evaluateCorrelationPenalty } from './correlation/correlationEngine';
 
 // Phase 4
 export { generatePhase4Signals } from './pipeline/generatePhase4Signals';
@@ -32,6 +39,7 @@ export { computeContextualModifiers } from './context/contextualModifiers';
 export { computeFreshness } from './freshness/signalDecay';
 export { evaluateOutcome, aggregatePerformance, calibrateConfidence, computeAdaptiveRecommendation, defaultFeedbackState } from './feedback/outcomeTracker';
 export { createMemoryEntry, buildPortfolioCommentary } from './memory/decisionMemory';
+export { saveOutcome, saveExplanation, saveDecisionMemory, loadFeedbackState, migratePhase4Tables } from './repository/savePhase4Artifacts';
 
 // Shared
 export { rankSignals } from './pipeline/rankSignals';
@@ -40,6 +48,10 @@ export { evaluateBullishBreakout } from './strategies/bullishBreakout';
 export { evaluateBullishPullback } from './strategies/bullishPullback';
 export { evaluateBearishBreakdown } from './strategies/bearishBreakdown';
 export { evaluateMeanReversionBounce } from './strategies/meanReversionBounce';
+export { evaluateMomentumContinuation } from './strategies/momentumContinuation';
+export { evaluateBullishDivergence } from './strategies/bullishDivergence';
+export { evaluateVolumeClimaxReversal } from './strategies/volumeClimaxReversal';
+export { evaluateGapContinuation } from './strategies/gapContinuation';
 export { buildSignalFeatures } from './features/buildSignalFeatures';
 export { scoreConfidence, scoreConfidenceForStrategy } from './scoring/confidenceScorer';
 export { scoreRisk } from './scoring/riskScorer';
@@ -77,6 +89,15 @@ export type {
   SignalSubtype,
   MarketContextTag,
   StrengthTag,
+  Phase2Signal,
+  Phase2PipelineResult,
+  StrategyRegistryEntry,
+  StrategyDirection,
+  SectorContext,
+  SectorTrendLabel,
+  EnhancedRelativeStrength,
+  ConflictResolution,
+  StrategyBreakdown,
 } from './types/signalEngine.types';
 
 export type {

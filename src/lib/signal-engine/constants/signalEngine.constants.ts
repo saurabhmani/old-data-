@@ -17,6 +17,15 @@ export const ROC_SHORT = 5;
 export const ROC_LONG = 20;
 export const VOLUME_AVG_PERIOD = 20;
 export const STRUCTURE_LOOKBACK = 20;
+export const STOCHASTIC_K_PERIOD = 14;
+export const STOCHASTIC_D_PERIOD = 3;
+export const BOLLINGER_PERIOD = 20;
+export const BOLLINGER_STD_DEV = 2;
+export const ADX_PERIOD = 14;
+export const OBV_SLOPE_PERIOD = 10;
+export const VWAP_PERIOD = 20;
+export const VOLUME_CLIMAX_THRESHOLD = 3.0;
+export const DIVERGENCE_LOOKBACK = 10;
 
 // ── Breakout ─────────────────────────────────────────────────
 export const BREAKOUT_BUFFER = 1.002;

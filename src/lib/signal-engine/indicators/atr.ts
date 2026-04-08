@@ -12,7 +12,14 @@ export function trueRange(current: Candle, previous: Candle): number {
 }
 
 export function computeAtr(candles: Candle[], period = 14): number[] {
-  if (candles.length < period + 1) return [];
+  if (candles.length < period + 1 || period <= 0) return [];
+  // Validate OHLC integrity of seed candles
+  for (let i = 0; i <= period; i++) {
+    const c = candles[i];
+    if (!isFinite(c.high) || !isFinite(c.low) || !isFinite(c.close) || c.high < c.low) {
+      return [];
+    }
+  }
 
   const atrValues: number[] = new Array(candles.length).fill(NaN);
 

@@ -58,6 +58,11 @@ export interface MomentumFeatures {
   macdHistogram: number;
   roc5: number;
   roc20: number;
+  stochasticK: number;
+  stochasticD: number;
+  adx: number;
+  bullishDivergence: boolean;
+  bearishDivergence: boolean;
 }
 
 export interface VolumeFeatures {
@@ -65,6 +70,10 @@ export interface VolumeFeatures {
   avgVolume20: number;
   volumeVs20dAvg: number;
   breakoutVolumeRatio: number;
+  obv: number;
+  obvSlope: number;
+  vwap: number;
+  volumeClimaxRatio: number;
 }
 
 export interface VolatilityFeatures {
@@ -72,6 +81,11 @@ export interface VolatilityFeatures {
   atrPct: number;
   dailyRangePct: number;
   gapPct: number;
+  bollingerUpper: number;
+  bollingerLower: number;
+  bollingerWidth: number;
+  bollingerPctB: number;
+  squeezed: boolean;
 }
 
 export interface StructureFeatures {
@@ -82,6 +96,10 @@ export interface StructureFeatures {
   distanceToSupportPct: number;
   recentHigh20: number;
   recentLow20: number;
+  isInsideDay: boolean;
+  rangeCompressionRatio: number;
+  consecutiveHigherLows: number;
+  consecutiveLowerHighs: number;
 }
 
 export interface ContextFeatures {
@@ -188,7 +206,11 @@ export type StrategyName =
   | 'bullish_breakout'
   | 'bullish_pullback'
   | 'bearish_breakdown'
-  | 'mean_reversion_bounce';
+  | 'mean_reversion_bounce'
+  | 'momentum_continuation'
+  | 'bullish_divergence'
+  | 'volume_climax_reversal'
+  | 'gap_continuation';
 
 export interface StrategyMatchResult {
   matched: boolean;
@@ -208,9 +230,9 @@ export interface StrategyCandidate {
 
 // ── Signal Classification ───────────────────────────────────
 
-export type SignalType = 'bullish_breakout' | 'bullish_pullback' | 'bearish_breakdown' | 'mean_reversion_bounce';
-export type SignalSubtype = 'fresh_breakout' | 'continuation' | 'pullback_entry' | 'reversal_bounce' | 'breakdown';
-export type SignalAction = 'enter_on_strength' | 'enter_on_pullback' | 'enter_short' | 'enter_on_bounce';
+export type SignalType = 'bullish_breakout' | 'bullish_pullback' | 'bearish_breakdown' | 'mean_reversion_bounce' | 'momentum_continuation' | 'bullish_divergence' | 'volume_climax_reversal' | 'gap_continuation';
+export type SignalSubtype = 'fresh_breakout' | 'continuation' | 'pullback_entry' | 'reversal_bounce' | 'breakdown' | 'momentum_ride' | 'divergence_reversal' | 'climax_reversal' | 'gap_and_go';
+export type SignalAction = 'enter_on_strength' | 'enter_on_pullback' | 'enter_short' | 'enter_on_bounce' | 'enter_on_momentum' | 'enter_on_divergence' | 'enter_on_climax' | 'enter_on_gap';
 export type SignalStatus = 'active' | 'watchlist' | 'expired' | 'invalidated';
 export type MarketContextTag = 'Bullish' | 'Neutral' | 'Weak';
 export type StrengthTag = 'High Conviction' | 'Actionable' | 'Watchlist' | 'Avoid';
@@ -273,4 +295,91 @@ export interface Phase1Config {
   minAvgVolume: number;
   minPrice: number;
   minConfidenceToSave: number;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Phase 2 Types — Strategy Context + Sector + Conflict
+// ════════════════════════════════════════════════════════════════
+
+// ── Strategy Registry ──────────────────────────────────────
+export type StrategyDirection = 'long' | 'short' | 'neutral';
+
+export interface StrategyRegistryEntry {
+  strategyId: StrategyName;
+  displayName: string;
+  direction: StrategyDirection;
+  allowedRegimes: MarketRegimeLabel[];
+  blockedRegimes: MarketRegimeLabel[];
+  minAdx?: number;
+  idealRsiRange: [number, number];
+  minVolumeExpansion?: number;
+  defaultConfidenceWeight: number;
+}
+
+// ── Sector Context ─────────────────────────────────────────
+export type SectorTrendLabel = 'Strong' | 'Positive' | 'Neutral' | 'Weak' | 'Declining';
+
+export interface SectorContext {
+  sector: string;
+  sectorStrengthScore: number;
+  sectorTrendLabel: SectorTrendLabel;
+  sectorRoc5: number;
+  sectorRoc20: number;
+  stockCountInSector: number;
+}
+
+// ── Enhanced Relative Strength (multi-period) ──────────────
+export interface EnhancedRelativeStrength extends RelativeStrengthFeatures {
+  rsVsIndex5d: number;
+  rsVsIndex20d: number;
+  rsVsSector5d: number;
+  rsVsSector20d: number;
+  rsTrend: 'improving' | 'stable' | 'deteriorating';
+  sectorTrendLabel: SectorTrendLabel;
+}
+
+// ── Conflict Resolution ────────────────────────────────────
+export interface ConflictResolution {
+  symbol: string;
+  winningStrategy: StrategyName;
+  winningScore: number;
+  losingStrategies: {
+    strategy: StrategyName;
+    score: number;
+    suppressionReason: string;
+  }[];
+  hadDirectionConflict: boolean;
+  resolvedAt: string;
+}
+
+// ── Strategy Breakdown (for persistence) ───────────────────
+export interface StrategyBreakdown {
+  strategyName: StrategyName;
+  matched: boolean;
+  confidenceScore: number;
+  riskScore: number;
+  regimeFit: number;
+  rsAlignment: number;
+  sectorFit: number;
+  structuralQuality: number;
+  rejectionReason?: string;
+}
+
+// ── Phase 2 Signal (extends QuantSignal) ───────────────────
+export interface Phase2Signal extends QuantSignal {
+  sectorContext: SectorContext;
+  enhancedRs: EnhancedRelativeStrength;
+  strategyBreakdowns: StrategyBreakdown[];
+  conflictResolution?: ConflictResolution;
+  freshnessTag: 'fresh' | 'aging' | 'stale';
+}
+
+// ── Phase 2 Pipeline Result ────────────────────────────────
+export interface Phase2PipelineResult {
+  regime: EnhancedMarketRegime;
+  signals: Phase2Signal[];
+  scanned: number;
+  matched: number;
+  conflicts: ConflictResolution[];
+  rejected: { symbol: string; strategy?: string; reason: string }[];
 }

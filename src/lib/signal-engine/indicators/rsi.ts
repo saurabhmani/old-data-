@@ -3,7 +3,11 @@
 // ════════════════════════════════════════════════════════════════
 
 export function computeRsi(closes: number[], period = 14): number[] {
-  if (closes.length < period + 1) return [];
+  if (closes.length < period + 1 || period <= 0) return [];
+  // Validate seed data
+  for (let i = 0; i <= period; i++) {
+    if (!isFinite(closes[i])) return [];
+  }
 
   const rsiValues: number[] = new Array(closes.length).fill(NaN);
 

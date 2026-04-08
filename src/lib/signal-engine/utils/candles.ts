@@ -53,5 +53,10 @@ export function lastCandle(candles: Candle[]): Candle {
 }
 
 export function previousCandle(candles: Candle[]): Candle {
+  if (candles.length < 2) {
+    // Return a safe fallback matching the last candle to avoid NaN propagation
+    const last = candles[candles.length - 1];
+    return last ?? { ts: '', open: 0, high: 0, low: 0, close: 0, volume: 0 };
+  }
   return candles[candles.length - 2];
 }

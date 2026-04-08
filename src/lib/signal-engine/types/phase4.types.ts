@@ -193,10 +193,10 @@ export interface Phase4SignalEnvelope {
   riskScore: number;
 
   // Phase 3 components
-  tradePlan: any;
-  positionSizing: any;
-  portfolioFit: any;
-  executionReadiness: any;
+  tradePlan: import('../types/phase3.types').Phase3TradePlan;
+  positionSizing: import('../types/phase3.types').PositionSizingResult;
+  portfolioFit: import('../types/phase3.types').PortfolioFitResult;
+  executionReadiness: import('../types/phase3.types').ExecutionReadiness;
 
   // Phase 4 intelligence
   macroContext: MacroContext;

@@ -8,6 +8,7 @@ import {
   RefreshCw, ArrowUpRight, ArrowDownRight, Minus,
   Shield, Activity, AlertTriangle, CheckCircle,
 } from 'lucide-react';
+import ConvictionDistribution from '@/components/dashboard/ConvictionDistribution';
 import styles from './dashboard.module.scss';
 
 interface MarketIntel {
@@ -340,6 +341,28 @@ export default function DashboardPage() {
               </tbody>
             </table>
           </Card>
+        </section>
+
+        {/* ── SECTION: CONVICTION DISTRIBUTION ──────────────────── */}
+        <section className={styles.section}>
+          <div className={styles.sectionHead}>
+            <Target size={14} />
+            <span>Conviction Distribution</span>
+          </div>
+          <ConvictionDistribution
+            signals={[
+              ...rankings.map(r => ({
+                conviction_band: r.conviction_band,
+                confidence_score: r.confidence_score ?? r.confidence,
+              })),
+              ...opps.map(o => ({
+                conviction_band: o.conviction_band,
+                confidence_score: o.confidence,
+              })),
+            ]}
+            loading={loading}
+            totalScanned={intel ? 50 : undefined}
+          />
         </section>
 
         {/* ── SECTION 3: TOP OPPORTUNITIES ─────────────────────── */}
