@@ -18,6 +18,11 @@ import { cacheGet, cacheSet }         from '@/lib/redis';
 import { generateSignal }             from './signalEngine';
 import type { Signal }                from './signalEngine';
 import { fetchGainersLosers }         from './nse';
+import { savePhase3Artifacts }        from '@/lib/signal-engine/repository/savePhase3Signals';
+import { saveDecisionMemory }         from '@/lib/signal-engine/repository/savePhase4Artifacts';
+import { buildSignalTimeline }        from '@/lib/signal-engine/memory/decisionMemory';
+import { ensureSignalEngineSchemas }  from '@/lib/signal-engine/repository/ensureSchemas';
+import type { Phase3TradePlan, PositionSizingResult, PortfolioFitResult, ExecutionReadiness, SignalLifecycle } from '@/lib/signal-engine/types/phase3.types';
 
 // ════════════════════════════════════════════════════════════════
 //  TYPES
@@ -263,6 +268,128 @@ async function persistFeatures(signalId: number, signal: Signal): Promise<void> 
 }
 
 // ════════════════════════════════════════════════════════════════
+//  PHASE 3 + 4 ENRICHMENT
+//  Translates the production Signal into Phase 3/4 typed artifacts
+//  and persists them so the new audit tables stay populated even
+//  while the old engine produces the actual signal.
+// ════════════════════════════════════════════════════════════════
+
+async function persistPhase3Enrichment(signalId: number, signal: Signal): Promise<void> {
+  const isShort = signal.direction === 'SELL';
+  const initialRiskPerUnit = Math.abs(signal.entry_price - signal.stop_loss);
+  if (initialRiskPerUnit <= 0) return;
+
+  const target3 = isShort
+    ? signal.entry_price - 3.5 * initialRiskPerUnit
+    : signal.entry_price + 3.5 * initialRiskPerUnit;
+
+  const tradePlan: Phase3TradePlan = {
+    entryType: 'breakout_confirmation',
+    entryZoneLow: Math.round((signal.entry_price * 0.998) * 100) / 100,
+    entryZoneHigh: Math.round(signal.entry_price * 100) / 100,
+    stopLoss: signal.stop_loss,
+    initialRiskPerUnit: Math.round(initialRiskPerUnit * 100) / 100,
+    target1: signal.target1,
+    target2: signal.target2,
+    target3: Math.round(target3 * 100) / 100,
+    rrTarget1: signal.risk_reward,
+    rrTarget2: Math.round(((Math.abs(signal.target2 - signal.entry_price) / initialRiskPerUnit) || 0) * 10) / 10,
+    rrTarget3: 3.5,
+  };
+
+  // Position sizing — derived from confidence + risk score
+  const portfolioCapital = 1_000_000; // canonical default
+  const riskBudgetPct = signal.confidence >= 75 ? 1.0 : signal.confidence >= 60 ? 0.75 : 0.5;
+  const riskBudgetAmount = portfolioCapital * (riskBudgetPct / 100);
+  const positionSizeUnits = initialRiskPerUnit > 0 ? Math.floor(riskBudgetAmount / initialRiskPerUnit) : 0;
+
+  const sizing: PositionSizingResult = {
+    capitalModel: 'fixed_fractional',
+    portfolioCapital,
+    riskBudgetPct,
+    riskBudgetAmount: Math.round(riskBudgetAmount * 100) / 100,
+    initialRiskPerUnit: tradePlan.initialRiskPerUnit,
+    positionSizeUnits,
+    grossPositionValue: Math.round(positionSizeUnits * signal.entry_price * 100) / 100,
+    validationStatus: positionSizeUnits > 0 ? 'valid' : 'invalid',
+    warnings: [],
+  };
+
+  // Portfolio fit — translated from production portfolio_fit score
+  const fit: PortfolioFitResult = {
+    fitScore: signal.portfolio_fit ?? 50,
+    sectorExposureImpact: signal.portfolio_fit >= 70 ? 'acceptable' : signal.portfolio_fit >= 50 ? 'moderate' : 'high',
+    directionImpact: 'acceptable',
+    capitalAvailability: 'sufficient',
+    correlationCluster: null,
+    correlationPenalty: 0,
+    portfolioDecision: signal.rejection_reasons.length === 0 ? 'approved' : 'rejected',
+    penalties: signal.soft_warnings ?? [],
+  };
+
+  // Execution readiness — translated from rejection state + conviction band
+  const approval: ExecutionReadiness['approvalDecision'] =
+    signal.rejection_reasons.length > 0 ? 'rejected'
+    : signal.conviction_band === 'reject' ? 'rejected'
+    : signal.conviction_band === 'watchlist' ? 'deferred'
+    : 'approved';
+
+  const status: ExecutionReadiness['status'] =
+    approval === 'approved' ? 'ready'
+    : approval === 'deferred' ? 'watchlist_only'
+    : signal.blocked_by?.risk ? 'rejected_due_to_risk'
+    : signal.blocked_by?.portfolio ? 'deferred_due_to_portfolio'
+    : 'rejected_due_to_reward_risk';
+
+  const actionTag: ExecutionReadiness['actionTag'] =
+    approval === 'approved' && signal.conviction_band === 'high_conviction' ? 'enter_now'
+    : approval === 'approved' ? 'enter_on_confirmation'
+    : approval === 'deferred' ? 'watch_only'
+    : 'avoid';
+
+  const readiness: ExecutionReadiness = {
+    status, actionTag, priorityRank: null,
+    approvalDecision: approval,
+    reasons: [...(signal.rejection_reasons ?? []), ...(signal.soft_warnings ?? [])],
+  };
+
+  // Lifecycle — initial state
+  const lifecycle: SignalLifecycle = {
+    state: approval === 'approved' ? 'approved' : approval === 'deferred' ? 'generated' : 'rejected',
+    reason: approval === 'approved' ? 'all_gates_passed' : (signal.rejection_reasons[0] ?? 'deferred_to_watchlist'),
+    changedAt: signal.generated_at,
+  };
+
+  await savePhase3Artifacts(signalId, tradePlan, sizing, fit, readiness, lifecycle);
+}
+
+async function persistPhase4DecisionMemory(signalId: number, signal: Signal): Promise<void> {
+  const timeline = buildSignalTimeline(signalId, [
+    {
+      stage: 'phase1_scan',
+      message: `Scanned ${signal.tradingsymbol}: direction=${signal.direction}, raw_score=${signal.score_raw ?? 0}`,
+      payload: { instrument_key: signal.instrument_key, ltp: signal.entry_price },
+    },
+    {
+      stage: 'phase2_strategy',
+      message: `Strategy=${signal.scenario_tag}, confidence=${signal.confidence}, regime=${signal.regime}`,
+      payload: { factor_scores: signal.factor_scores, conviction_band: signal.conviction_band },
+    },
+    {
+      stage: 'phase3_execution',
+      message: `Approval=${signal.rejection_reasons.length === 0 ? 'approved' : 'rejected'}, fit=${signal.portfolio_fit}, risk=${signal.risk_score}`,
+      payload: { rejection_reasons: signal.rejection_reasons, soft_warnings: signal.soft_warnings, blocked_by: signal.blocked_by },
+    },
+    {
+      stage: 'phase4_enrichment',
+      message: `Stance=${signal.market_stance}, regime_alignment=${signal.regime_alignment}, opportunity=${signal.opportunity_score}`,
+      payload: { confidence_components: signal.confidence_components ?? {} },
+    },
+  ]);
+  await saveDecisionMemory(timeline);
+}
+
+// ════════════════════════════════════════════════════════════════
 //  MAIN PIPELINE
 // ════════════════════════════════════════════════════════════════
 
@@ -271,6 +398,11 @@ export async function runSignalPipeline(limit = 60): Promise<PipelineResult> {
   const batchId = `batch_${Date.now()}`;
 
   console.log(`[Pipeline] Starting batch ${batchId} — limit ${limit}`);
+
+  // Ensure all Phase 3/4 audit tables exist before persisting enriched artifacts
+  await ensureSignalEngineSchemas().catch(err =>
+    console.error('[Pipeline] Schema ensure failed (non-blocking):', (err as Error).message),
+  );
 
   // Step 1: Load universe
   const universe = await loadUniverse(limit);
@@ -337,12 +469,15 @@ export async function runSignalPipeline(limit = 60): Promise<PipelineResult> {
     .sort((a, b) => b.signal.opportunity_score - a.signal.opportunity_score);
 
   // Step 4: Persist all signals (approved as 'active', rejected as 'flagged')
+  // Phase 3+4 enrichment is also persisted alongside the base signal record.
   for (const { signal, isApproved } of dedupedSignals) {
     const signalId = await persistSignalFull(signal, batchId, isApproved ? 'active' : 'flagged');
     if (signalId) {
       await Promise.all([
         persistReasons(signalId, signal),
         persistFeatures(signalId, signal),
+        persistPhase3Enrichment(signalId, signal).catch(err => console.error('[Pipeline] Phase3 persist failed:', (err as Error).message)),
+        persistPhase4DecisionMemory(signalId, signal).catch(err => console.error('[Pipeline] Phase4 memory persist failed:', (err as Error).message)),
       ]);
     }
   }

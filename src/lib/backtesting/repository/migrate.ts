@@ -4,6 +4,15 @@
 
 import { db } from '@/lib/db';
 
+let _migrated = false;
+
+/** Ensure tables exist (idempotent, runs once per process) */
+export async function ensureBacktestTables(): Promise<void> {
+  if (_migrated) return;
+  await migrateBacktestTables();
+  _migrated = true;
+}
+
 export async function migrateBacktestTables(): Promise<void> {
   // 1. Backtest runs
   await db.query(`

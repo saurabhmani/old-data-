@@ -9,10 +9,12 @@ import { persistFullRun } from '@/lib/backtesting/runner/runOrchestrator';
 import { listBacktestRuns } from '@/lib/backtesting/repository/persistence';
 import { validateBacktestConfig } from '@/lib/backtesting/utils/validation';
 import { DEFAULT_BACKTEST_CONFIG } from '@/lib/backtesting/config/defaults';
+import { ensureBacktestTables } from '@/lib/backtesting/repository/migrate';
 import type { BacktestRunConfig } from '@/lib/backtesting/types';
 
 export async function POST(req: NextRequest) {
   try {
+    await ensureBacktestTables();
     const body = await req.json();
     const config: BacktestRunConfig = { ...DEFAULT_BACKTEST_CONFIG, ...body.config };
 
@@ -26,29 +28,30 @@ export async function POST(req: NextRequest) {
 
     const result = await runBacktest(config);
 
-    // Full orchestration: compute all metrics + persist everything
+    // Single explicit truth-chain persistence — every artifact comes from
+    // the in-memory run result, no implicit reconstruction.
     let orchestrated;
+    let orchestrationError: string | null = null;
     try {
       orchestrated = await persistFullRun(result);
     } catch (err) {
+      orchestrationError = err instanceof Error ? err.message : String(err);
       console.error('[API] Orchestration failed:', err);
     }
 
     return NextResponse.json({
       runId: result.runId,
       status: result.status,
-      tradeCount: result.tradeCount,
       signalCount: result.signalCount,
+      tradeCount: result.tradeCount,
       durationMs: result.durationMs,
       message: result.status === 'completed'
-        ? `Completed: ${result.tradeCount} trades, ${((result.summary?.winRate ?? 0) * 100).toFixed(0)}% win rate, ${result.summary?.totalReturnPct ?? 0}% return`
+        ? `Completed: ${result.tradeCount} trades, ${((result.summary?.winRate ?? 0) * 100).toFixed(0)}% win rate, ${result.summary?.totalReturnPct?.toFixed(2) ?? 0}% return`
         : `${result.status}: ${result.error ?? ''}`,
-      persisted: orchestrated ? {
-        metrics: orchestrated.persistedMetrics,
-        calibration: orchestrated.persistedCalibrationBuckets,
-        signals: orchestrated.persistedSignals,
-      } : null,
+      // Per spec section 6 — full per-table persistence summary
+      persistenceSummary: orchestrated?.persistenceSummary ?? null,
       verdict: orchestrated?.dexterOutput?.verdict ?? null,
+      orchestrationError,
     });
   } catch (err) {
     console.error('[API] Backtest error:', err);
@@ -61,6 +64,7 @@ export async function POST(req: NextRequest) {
 
 export async function GET() {
   try {
+    await ensureBacktestTables();
     const runs = await listBacktestRuns();
     return NextResponse.json({ runs });
   } catch (err) {

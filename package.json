@@ -16,7 +16,14 @@
     "scheduler:dev": "NODE_ENV=development ts-node -P tsconfig.node.json -r tsconfig-paths/register src/lib/workers/scheduler.ts",
     "db:migrate-q365": "ts-node -P tsconfig.node.json -r tsconfig-paths/register src/lib/db/migrateQ365.ts",
     "db:seed-users": "ts-node -P tsconfig.node.json src/lib/db/seedUsers.ts",
-    "db:setup": "ts-node -P tsconfig.node.json src/lib/db/setup.ts"
+    "db:setup": "ts-node -P tsconfig.node.json src/lib/db/setup.ts",
+    "test:phase1": "tsx src/__tests__/backtestingPhase1.test.ts",
+    "test:phase2": "tsx src/__tests__/backtestingPhase2.test.ts",
+    "test:phase3": "tsx src/__tests__/backtestingPhase3.test.ts",
+    "test:phase4": "tsx src/__tests__/backtestingPhase4.test.ts",
+    "test:verify": "tsx src/__tests__/verifyEnd2End.ts",
+    "test:e2e": "tsx src/__tests__/runEnd2End.ts",
+    "test:all": "npm run test:phase1 && npm run test:phase2 && npm run test:phase3 && npm run test:phase4"
   },
   "dependencies": {
     "@anthropic-ai/claude-code": "^2.1.92",
@@ -59,6 +66,7 @@
     "eslint": "^8",
     "eslint-config-next": "14.2.5",
     "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
     "typescript": "^5"
   }
 }

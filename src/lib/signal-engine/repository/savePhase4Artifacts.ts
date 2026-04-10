@@ -103,7 +103,7 @@ export async function loadFeedbackState(
       [strategyName, regime],
     );
 
-    const rows = Array.isArray(result) ? result : (result.rows ?? []);
+    const rows = result.rows ?? [];
     const row = rows[0];
     if (!row || row.total < 5) return { winRate: null, sampleSize: row?.total ?? 0 };
 
@@ -114,6 +114,14 @@ export async function loadFeedbackState(
   } catch {
     return { winRate: null, sampleSize: 0 };
   }
+}
+
+// ── Idempotent ensure (runs once per process) ─────────────
+let _phase4Migrated = false;
+export async function ensurePhase4Tables(): Promise<void> {
+  if (_phase4Migrated) return;
+  await migratePhase4Tables();
+  _phase4Migrated = true;
 }
 
 // ── Migration: Phase 4 tables ──────────────────────────────

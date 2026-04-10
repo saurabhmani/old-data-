@@ -35,7 +35,7 @@ export async function saveBacktestRun(
         position_size, position_value, risk_amount, slippage_cost, commission_cost,
         gross_pnl, net_pnl, return_pct, return_r, outcome, exit_reason,
         mfe_pct, mae_pct, mfe_r, mae_r, target1_hit, target2_hit, target3_hit, stop_hit)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         run.runId, trade.tradeId, trade.signalId, trade.symbol, trade.sector,
         trade.direction, trade.strategy, trade.regime,
@@ -71,16 +71,15 @@ export async function loadBacktestRun(runId: string): Promise<any | null> {
   const result = await db.query(
     `SELECT * FROM backtest_runs WHERE run_id = ?`, [runId],
   );
-  const rows = Array.isArray(result) ? result : (result.rows ?? []);
-  return rows[0] ?? null;
+  return (result.rows ?? [])[0] ?? null;
 }
 
 /** List all backtest runs */
 export async function listBacktestRuns(): Promise<any[]> {
   const result = await db.query(
-    `SELECT run_id, name, status, started_at, completed_at, summary_json FROM backtest_runs ORDER BY started_at DESC LIMIT 50`,
+    `SELECT run_id, name, status, started_at, completed_at, duration_ms, signal_count, trade_count, summary_json, strategy_breakdown_json, config_json FROM backtest_runs ORDER BY started_at DESC LIMIT 50`,
   );
-  return Array.isArray(result) ? result : (result.rows ?? []);
+  return result.rows ?? [];
 }
 
 /** Load trades for a specific run */
@@ -88,7 +87,7 @@ export async function loadBacktestTrades(runId: string): Promise<any[]> {
   const result = await db.query(
     `SELECT * FROM backtest_trades WHERE run_id = ? ORDER BY signal_date`, [runId],
   );
-  return Array.isArray(result) ? result : (result.rows ?? []);
+  return result.rows ?? [];
 }
 
 /** Load equity curve for a specific run */
@@ -96,5 +95,5 @@ export async function loadEquityCurve(runId: string): Promise<any[]> {
   const result = await db.query(
     `SELECT * FROM backtest_equity_curve WHERE run_id = ? ORDER BY date`, [runId],
   );
-  return Array.isArray(result) ? result : (result.rows ?? []);
+  return result.rows ?? [];
 }

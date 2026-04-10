@@ -4,9 +4,11 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { loadBacktestTrades } from '@/lib/backtesting/repository/persistence';
+import { ensureBacktestTables } from '@/lib/backtesting/repository/migrate';
 
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
   try {
+    await ensureBacktestTables();
     const trades = await loadBacktestTrades(params.id);
     return NextResponse.json({ runId: params.id, trades, total: trades.length });
   } catch (err) {

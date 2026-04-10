@@ -5,8 +5,13 @@
 import { db } from '@/lib/db';
 import type { QuantSignal } from '../types/signalEngine.types';
 
-export async function saveSignals(signals: QuantSignal[]): Promise<void> {
-  if (signals.length === 0) return;
+/**
+ * Save signals and return map of symbol → inserted DB ID.
+ * This enables downstream saves (breakdowns, explanations) to reference real IDs.
+ */
+export async function saveSignals(signals: QuantSignal[]): Promise<Map<string, number>> {
+  const idMap = new Map<string, number>();
+  if (signals.length === 0) return idMap;
 
   // Expire old active/watchlist signals for symbols we're about to insert
   const symbols = signals.map((s) => s.symbol);
@@ -19,35 +24,43 @@ export async function saveSignals(signals: QuantSignal[]): Promise<void> {
 
   for (const signal of signals) {
     try {
-      await saveOneSignal(signal);
+      const signalId = await saveOneSignal(signal);
+      if (signalId) idMap.set(signal.symbol, signalId);
     } catch (err) {
       console.error(`[SignalEngine] Failed to save signal for ${signal.symbol}:`, err);
     }
   }
+  return idMap;
 }
 
-async function saveOneSignal(s: QuantSignal): Promise<void> {
-  // 1. Insert main signal record (MySQL uses insertId, not RETURNING)
+async function saveOneSignal(s: QuantSignal): Promise<number | null> {
+  // 1. Insert main signal record — matches actual q365_signals schema
+  const direction = s.action === 'enter_short' ? 'SELL' : 'BUY';
+  const entryPrice = s.entry.zoneHigh; // conservative entry price
+  const riskReward = Math.round(s.rewardRiskApprox * 10) / 10;
+
   const result: any = await db.query(
     `INSERT INTO q365_signals
-      (symbol, timeframe, signal_type, action_type, confidence_score, confidence_band,
-       risk_score, risk_band, entry_zone_low, entry_zone_high, stop_loss, target1, target2,
-       reward_risk_approx, market_regime, status, generated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (symbol, instrument_key, exchange, direction, timeframe, signal_type,
+       confidence_score, confidence_band, risk_score, risk_band,
+       entry_price, stop_loss, target1, target2, risk_reward,
+       market_regime, status, generated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
-      s.symbol, s.timeframe, s.signalType, s.action,
+      s.symbol, `NSE_EQ|${s.symbol}`, 'NSE', direction,
+      s.timeframe, s.signalType,
       s.confidenceScore, s.confidenceBand,
       s.riskScore, s.riskBand,
-      s.entry.zoneLow, s.entry.zoneHigh,
-      s.stopLoss, s.targets.target1, s.targets.target2,
-      s.rewardRiskApprox, s.marketRegime,
-      s.status, s.generatedAt,
+      entryPrice, s.stopLoss, s.targets.target1, s.targets.target2,
+      riskReward, s.marketRegime,
+      s.status === 'active' ? 'active' : s.status === 'watchlist' ? 'watchlist' : 'active',
+      s.generatedAt,
     ],
   );
 
-  // MySQL returns insertId directly; fallback to rows for compatibility
-  const signalId = result.insertId ?? result.rows?.[0]?.id;
-  if (!signalId) return;
+  // db.query now exposes insertId directly for INSERT statements
+  const signalId = result.insertId;
+  if (!signalId) return null;
 
   // 2. Batch insert reasons and warnings
   const allReasons = [
@@ -70,6 +83,8 @@ async function saveOneSignal(s: QuantSignal): Promise<void> {
     `INSERT INTO q365_signal_feature_snapshots (signal_id, features_json) VALUES (?, ?)`,
     [signalId, featuresJson],
   );
+
+  return signalId;
 }
 
 export async function getLatestSignals(limit = 20): Promise<any[]> {
@@ -86,7 +101,7 @@ export async function getLatestSignals(limit = 20): Promise<any[]> {
     [limit],
   );
 
-  const rows: any[] = Array.isArray(result) ? result : (result.rows ?? []);
+  const rows: any[] = result.rows ?? [];
   return rows.map((row: any) => ({
     symbol: row.symbol,
     timeframe: row.timeframe,

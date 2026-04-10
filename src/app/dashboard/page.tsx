@@ -7,6 +7,7 @@ import {
   TrendingUp, TrendingDown, BarChart2, Zap, Target,
   RefreshCw, ArrowUpRight, ArrowDownRight, Minus,
   Shield, Activity, AlertTriangle, CheckCircle,
+  FlaskConical, Play, Database, Download, ShieldAlert, Scan,
 } from 'lucide-react';
 import ConvictionDistribution from '@/components/dashboard/ConvictionDistribution';
 import styles from './dashboard.module.scss';
@@ -40,6 +41,60 @@ interface OpportunityRow {
   stop_loss: number | null; target1: number | null;
   risk_reward: number | null; opportunity_score: number;
   conviction_band: string | null; scenario_tag: string | null;
+}
+
+interface BacktestRunRow {
+  run_id: string;
+  name: string;
+  status: string;
+  started_at: string;
+  completed_at: string | null;
+  duration_ms: number | null;
+  signal_count: number;
+  trade_count: number;
+  config_json: any;
+  summary_json: any;
+  strategy_breakdown_json: any;
+}
+
+interface BacktestSummaryData {
+  totalSignalsGenerated: number;
+  totalTradesTaken: number;
+  winRate: number;
+  profitFactor: number;
+  totalReturnPct: number;
+  maxDrawdownPct: number;
+  sharpeRatio: number;
+  expectancyR: number;
+  avgBarsInTrade: number;
+  target1HitRate: number;
+  target2HitRate: number;
+  target3HitRate: number;
+  initialCapital: number;
+  finalEquity: number;
+  annualizedReturnPct: number;
+  sortinoRatio: number;
+  calmarRatio: number;
+  avgWinPct: number;
+  avgLossPct: number;
+  totalWins: number;
+  totalLosses: number;
+}
+
+interface BacktestTradeRow {
+  trade_id: string;
+  symbol: string;
+  direction: string;
+  strategy: string;
+  entry_date: string | null;
+  exit_date: string | null;
+  entry_price: number;
+  exit_price: number | null;
+  net_pnl: number;
+  return_pct: number;
+  return_r: number;
+  outcome: string;
+  exit_reason: string | null;
 }
 
 const TREND_META: Record<string, { color: string; bg: string; Icon: React.ElementType }> = {
@@ -100,6 +155,166 @@ export default function DashboardPage() {
   const [loading,  setLoading]  = useState(true);
   const [lastAt,   setLastAt]   = useState<string | null>(null);
 
+  // ── Backtesting state ───────────────────────────────────
+  const [btRuns,       setBtRuns]       = useState<BacktestRunRow[]>([]);
+  const [btSelected,   setBtSelected]   = useState<string | null>(null);
+  const [btSummary,    setBtSummary]    = useState<BacktestSummaryData | null>(null);
+  const [btTrades,     setBtTrades]     = useState<BacktestTradeRow[]>([]);
+  const [btLoading,    setBtLoading]    = useState(false);
+  const [btRunning,    setBtRunning]    = useState(false);
+  const [btError,      setBtError]      = useState<string | null>(null);
+  const [btStratBreak, setBtStratBreak] = useState<any[]>([]);
+
+  // ── Data seeding state ──────────────────────────────────
+  const [dataReady,    setDataReady]    = useState<number | null>(null);
+  const [dataTotal,    setDataTotal]    = useState<number>(0);
+  const [dataSeeding,  setDataSeeding]  = useState(false);
+  const [seedStatus,   setSeedStatus]   = useState<string | null>(null);
+
+  // ── Manipulation detection state ────────────────────────
+  const [mdAlerts,     setMdAlerts]     = useState<any[]>([]);
+  const [mdLoading,    setMdLoading]    = useState(false);
+  const [mdScanning,   setMdScanning]   = useState(false);
+  const [mdSummary,    setMdSummary]    = useState<{ totalAlerts: number; bySeverity: Record<string, number> } | null>(null);
+
+  const checkDataAvailability = useCallback(async () => {
+    try {
+      const res = await fetch('/api/backtests/seed-data');
+      const data = await res.json();
+      setDataReady(data.readySymbols ?? 0);
+      setDataTotal(data.totalSymbols ?? 0);
+      return data.readySymbols ?? 0;
+    } catch { return 0; }
+  }, []);
+
+  const seedData = async () => {
+    setDataSeeding(true);
+    setSeedStatus('Fetching historical data from Yahoo Finance...');
+    setBtError(null);
+    try {
+      const res = await fetch('/api/backtests/seed-data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ range: '2y' }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setBtError(data.error || 'Seed failed'); return; }
+      setSeedStatus(`Done: ${data.seeded} symbols seeded, ${data.totalCandles} candles loaded (${(data.durationMs / 1000).toFixed(0)}s)`);
+      await checkDataAvailability();
+    } catch (err) {
+      setBtError(err instanceof Error ? err.message : 'Seed failed');
+    } finally {
+      setDataSeeding(false);
+    }
+  };
+
+  const loadManipulationAlerts = useCallback(async () => {
+    try {
+      const res = await fetch('/api/manipulation?action=summary');
+      const data = await res.json();
+      setMdSummary({ totalAlerts: data.totalAlerts ?? 0, bySeverity: data.bySeverity ?? {} });
+      setMdAlerts(data.topAlerts ?? []);
+    } catch { /* ignore */ }
+  }, []);
+
+  const runManipulationScan = async () => {
+    setMdScanning(true);
+    try {
+      const res = await fetch('/api/manipulation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+      const data = await res.json();
+      if (data.alerts) setMdAlerts(data.alerts.slice(0, 10));
+      setMdSummary({ totalAlerts: data.alertsGenerated ?? 0, bySeverity: {} });
+      await loadManipulationAlerts();
+    } catch { /* ignore */ }
+    finally { setMdScanning(false); }
+  };
+
+  const loadBacktestRuns = useCallback(async () => {
+    try {
+      const res = await fetch('/api/backtests');
+      const data = await res.json();
+      const runs = data.runs ?? [];
+      setBtRuns(runs);
+      // Auto-select latest completed run
+      if (runs.length > 0 && !btSelected) {
+        const completed = runs.find((r: BacktestRunRow) => r.status === 'completed');
+        if (completed) loadBacktestDetail(completed.run_id);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  const loadBacktestDetail = async (runId: string) => {
+    setBtSelected(runId);
+    setBtLoading(true);
+    setBtError(null);
+    try {
+      const [detailRes, tradesRes] = await Promise.allSettled([
+        fetch(`/api/backtests/${runId}/analytics`).then(r => r.json()),
+        fetch(`/api/backtests/${runId}/trades`).then(r => r.json()),
+      ]);
+      if (detailRes.status === 'fulfilled') {
+        // Coerce all numeric fields — DB JSON columns can return strings
+        const rawSummary = detailRes.value.summary;
+        if (rawSummary) {
+          const numericKeys: (keyof BacktestSummaryData)[] = [
+            'totalSignalsGenerated', 'totalTradesTaken', 'winRate', 'profitFactor',
+            'totalReturnPct', 'maxDrawdownPct', 'sharpeRatio', 'expectancyR',
+            'avgBarsInTrade', 'target1HitRate', 'target2HitRate', 'target3HitRate',
+            'initialCapital', 'finalEquity', 'annualizedReturnPct', 'sortinoRatio',
+            'calmarRatio', 'avgWinPct', 'avgLossPct', 'totalWins', 'totalLosses',
+          ];
+          const normalized = { ...rawSummary };
+          for (const k of numericKeys) {
+            normalized[k] = Number(rawSummary[k] ?? 0);
+          }
+          setBtSummary(normalized);
+        } else {
+          setBtSummary(null);
+        }
+        setBtStratBreak(detailRes.value.strategyBreakdown ?? []);
+      }
+      if (tradesRes.status === 'fulfilled') {
+        setBtTrades(tradesRes.value.trades ?? []);
+      }
+    } catch (err) {
+      setBtError(err instanceof Error ? err.message : 'Failed to load');
+    } finally {
+      setBtLoading(false);
+    }
+  };
+
+  const cleanupFailedRuns = async () => {
+    const failed = btRuns.filter(r => r.status === 'failed');
+    if (failed.length === 0) return;
+    if (!confirm(`Delete ${failed.length} failed backtest run(s)?`)) return;
+
+    try {
+      await Promise.all(failed.map(r =>
+        fetch(`/api/backtests/${r.run_id}`, { method: 'DELETE' }),
+      ));
+      await loadBacktestRuns();
+    } catch (err) {
+      setBtError(err instanceof Error ? err.message : 'Cleanup failed');
+    }
+  };
+
+  const runNewBacktest = async () => {
+    setBtRunning(true);
+    setBtError(null);
+    try {
+      const res = await fetch('/api/backtests', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ config: {} }) });
+      const data = await res.json();
+      if (!res.ok) { setBtError(data.error || 'Backtest failed'); return; }
+      // Reload runs and select the new one
+      await loadBacktestRuns();
+      if (data.runId) loadBacktestDetail(data.runId);
+    } catch (err) {
+      setBtError(err instanceof Error ? err.message : 'Failed to run backtest');
+    } finally {
+      setBtRunning(false);
+    }
+  };
+
   const load = useCallback(async (spinner = true) => {
     if (spinner) setLoading(true);
     try {
@@ -117,7 +332,7 @@ export default function DashboardPage() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(); loadBacktestRuns(); checkDataAvailability(); loadManipulationAlerts(); }, [load, loadBacktestRuns, checkDataAvailability, loadManipulationAlerts]);
 
   const trend = intel?.marketTrend ?? 'Neutral';
   const tm    = TREND_META[trend] ?? TREND_META['Neutral'];
@@ -429,6 +644,391 @@ export default function DashboardPage() {
               </div>
             )}
           </div>
+        </section>
+
+        {/* ── SECTION: MANIPULATION DETECTION ───────────────── */}
+        <section className={styles.section}>
+          <div className={styles.sectionHead}>
+            <ShieldAlert size={14} />
+            <span>Manipulation Detection</span>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+            <button className="btn btn--secondary btn--sm" onClick={runManipulationScan} disabled={mdScanning}
+              style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              {mdScanning ? <RefreshCw size={13} className={styles.spin} /> : <Scan size={13} />}
+              {mdScanning ? 'Scanning...' : 'Run Scan'}
+            </button>
+            {mdSummary && (
+              <div style={{ display: 'flex', gap: 12, fontSize: 12 }}>
+                <span>Alerts: <strong>{mdSummary.totalAlerts}</strong></span>
+                {mdSummary.bySeverity?.critical > 0 && (
+                  <span style={{ color: '#DC2626', fontWeight: 700 }}>Critical: {mdSummary.bySeverity.critical}</span>
+                )}
+                {mdSummary.bySeverity?.warning > 0 && (
+                  <span style={{ color: '#D97706', fontWeight: 700 }}>Warning: {mdSummary.bySeverity.warning}</span>
+                )}
+              </div>
+            )}
+          </div>
+
+          {mdAlerts.length > 0 ? (
+            <Card>
+              <table className={styles.btTradeTable}>
+                <thead>
+                  <tr>
+                    {['SYMBOL', 'TYPE', 'SEVERITY', 'SCORE', 'HEADLINE', 'DETECTED'].map(h => (
+                      <th key={h}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {mdAlerts.slice(0, 10).map((a: any) => (
+                    <tr key={a.alertId ?? a.alert_id}>
+                      <td style={{ fontWeight: 700 }}>{a.symbol}</td>
+                      <td style={{ fontSize: 11 }}>{(a.type ?? '').replace(/_/g, ' ')}</td>
+                      <td>
+                        <span style={{
+                          background: a.severity === 'critical' ? '#FEE2E2' : a.severity === 'warning' ? '#FEF3C7' : '#F1F5F9',
+                          color: a.severity === 'critical' ? '#DC2626' : a.severity === 'warning' ? '#D97706' : '#64748B',
+                          fontWeight: 700, fontSize: 10, padding: '2px 8px', borderRadius: 99,
+                        }}>
+                          {(a.severity ?? '').toUpperCase()}
+                        </span>
+                      </td>
+                      <td style={{ fontWeight: 700, color: a.score >= 70 ? '#DC2626' : a.score >= 45 ? '#D97706' : '#64748B' }}>
+                        {a.score}
+                      </td>
+                      <td style={{ fontSize: 11, maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {a.headline}
+                      </td>
+                      <td style={{ fontSize: 11, color: '#94A3B8' }}>
+                        {a.detectedAt || a.detected_at ? new Date(a.detectedAt ?? a.detected_at).toLocaleDateString('en-IN') : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Card>
+          ) : (
+            <Card>
+              <div style={{ padding: 24, textAlign: 'center', color: '#94A3B8', fontSize: 12 }}>
+                <ShieldAlert size={20} style={{ marginBottom: 6, opacity: 0.5 }} />
+                <div>No manipulation alerts. Click "Run Scan" to analyze the universe.</div>
+              </div>
+            </Card>
+          )}
+        </section>
+
+        {/* ── SECTION 4: BACKTESTING ENGINE ──────────────────── */}
+        <section className={styles.section}>
+          <div className={styles.sectionHead}>
+            <FlaskConical size={14} />
+            <span>Backtesting Engine</span>
+          </div>
+
+          {/* Data availability banner */}
+          {dataReady !== null && dataReady < dataTotal && (
+            <div style={{
+              background: '#FEF3C7', borderRadius: 8, padding: '10px 16px', marginBottom: 16,
+              border: '1px solid #F59E0B33', display: 'flex', alignItems: 'center', gap: 12,
+            }}>
+              <Database size={16} color="#D97706" />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: '#92400E' }}>
+                  Historical data: {dataReady}/{dataTotal} symbols ready
+                </div>
+                <div style={{ fontSize: 11, color: '#92400E' }}>
+                  {dataReady === 0
+                    ? 'No EOD candle data found. Seed historical data before running backtests.'
+                    : `${dataTotal - dataReady} symbols missing data. Seed to fetch from Yahoo Finance.`}
+                </div>
+              </div>
+              <button
+                className="btn btn--secondary btn--sm"
+                onClick={seedData}
+                disabled={dataSeeding}
+                style={{ display: 'flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}
+              >
+                {dataSeeding ? <RefreshCw size={12} className={styles.spin} /> : <Download size={12} />}
+                {dataSeeding ? 'Seeding...' : 'Seed Data'}
+              </button>
+            </div>
+          )}
+
+          {dataReady !== null && dataReady >= dataTotal && dataTotal > 0 && (
+            <div style={{
+              background: '#F0FDF4', borderRadius: 8, padding: '8px 16px', marginBottom: 16,
+              border: '1px solid #16A34A33', display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
+            }}>
+              <CheckCircle size={14} color="#15803D" />
+              <span style={{ color: '#065F46', fontWeight: 600 }}>All {dataTotal} symbols have historical data</span>
+            </div>
+          )}
+
+          {seedStatus && (
+            <div style={{ fontSize: 11, color: '#1D4ED8', marginBottom: 12, padding: '6px 12px', background: '#EFF6FF', borderRadius: 6, border: '1px solid #BFDBFE' }}>
+              {seedStatus}
+            </div>
+          )}
+
+          {/* Run button + run selector */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+            <button
+              className="btn btn--primary btn--sm"
+              onClick={runNewBacktest}
+              disabled={btRunning || dataSeeding}
+              style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+            >
+              {btRunning ? <RefreshCw size={13} className={styles.spin} /> : <Play size={13} />}
+              {btRunning ? 'Running...' : 'Run Backtest'}
+            </button>
+
+            {btRuns.filter(r => r.status === 'completed').length > 0 && (
+              <select
+                value={btSelected ?? ''}
+                onChange={e => { if (e.target.value) loadBacktestDetail(e.target.value); }}
+                style={{ fontSize: 12, padding: '6px 10px', borderRadius: 6, border: '1px solid #E2E8F0', background: '#F8FAFC', color: '#1E293B' }}
+              >
+                <option value="">Select a run...</option>
+                {btRuns.filter(r => r.status === 'completed').map(r => (
+                  <option key={r.run_id} value={r.run_id}>
+                    {r.name} — {r.trade_count} trades — {new Date(r.started_at).toLocaleDateString('en-IN')}
+                  </option>
+                ))}
+              </select>
+            )}
+
+            {/* Cleanup failed runs */}
+            {btRuns.filter(r => r.status === 'failed').length > 0 && (
+              <button
+                className="btn btn--secondary btn--sm"
+                onClick={cleanupFailedRuns}
+                style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}
+                title="Delete all failed backtest runs"
+              >
+                <AlertTriangle size={11} />
+                Delete {btRuns.filter(r => r.status === 'failed').length} failed
+              </button>
+            )}
+
+            {btError && (
+              <span style={{ fontSize: 11, color: '#DC2626', fontWeight: 600 }}>
+                <AlertTriangle size={12} style={{ verticalAlign: -2 }} /> {btError}
+              </span>
+            )}
+          </div>
+
+          {/* Summary stats */}
+          {btLoading && (
+            <div style={{ padding: 32, textAlign: 'center', color: '#94A3B8' }}>
+              <RefreshCw size={18} className={styles.spin} style={{ marginBottom: 8 }} />
+              <div style={{ fontSize: 12 }}>Loading backtest results...</div>
+            </div>
+          )}
+
+          {!btLoading && btSummary && (
+            <>
+              {/* KPI row */}
+              <div className={styles.btGrid}>
+                {[
+                  { label: 'Total Return', value: `${btSummary.totalReturnPct >= 0 ? '+' : ''}${btSummary.totalReturnPct.toFixed(2)}%`, color: btSummary.totalReturnPct >= 0 ? '#15803D' : '#DC2626', sub: `Annual: ${btSummary.annualizedReturnPct?.toFixed(1) ?? '—'}%` },
+                  { label: 'Win Rate', value: `${(btSummary.winRate * 100).toFixed(1)}%`, color: btSummary.winRate >= 0.5 ? '#15803D' : '#DC2626', sub: `${btSummary.totalWins}W / ${btSummary.totalLosses}L` },
+                  { label: 'Profit Factor', value: btSummary.profitFactor.toFixed(2), color: btSummary.profitFactor >= 1.5 ? '#15803D' : btSummary.profitFactor >= 1 ? '#D97706' : '#DC2626', sub: `Expectancy: ${btSummary.expectancyR.toFixed(2)}R` },
+                  { label: 'Max Drawdown', value: `${btSummary.maxDrawdownPct.toFixed(2)}%`, color: btSummary.maxDrawdownPct <= 10 ? '#15803D' : btSummary.maxDrawdownPct <= 20 ? '#D97706' : '#DC2626', sub: `Sharpe: ${btSummary.sharpeRatio.toFixed(2)}` },
+                ].map(s => (
+                  <div key={s.label} className={styles.btStatBox}>
+                    <div className={styles.btStatLabel}>{s.label}</div>
+                    <div className={styles.btStatValue} style={{ color: s.color }}>{s.value}</div>
+                    <div className={styles.btStatSub}>{s.sub}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Secondary metrics row */}
+              <div className={styles.btGrid}>
+                {[
+                  { label: 'Trades', value: btSummary.totalTradesTaken.toString(), sub: `Signals: ${btSummary.totalSignalsGenerated}` },
+                  { label: 'Avg Win', value: `+${btSummary.avgWinPct.toFixed(2)}%`, sub: `Avg Loss: ${btSummary.avgLossPct.toFixed(2)}%` },
+                  { label: 'Avg Holding', value: `${btSummary.avgBarsInTrade.toFixed(1)} bars`, sub: `Sortino: ${btSummary.sortinoRatio?.toFixed(2) ?? '—'}` },
+                  { label: 'Target Hit Rates', value: `T1: ${(btSummary.target1HitRate * 100).toFixed(0)}%`, sub: `T2: ${(btSummary.target2HitRate * 100).toFixed(0)}% · T3: ${(btSummary.target3HitRate * 100).toFixed(0)}%` },
+                ].map(s => (
+                  <div key={s.label} className={styles.btStatBox}>
+                    <div className={styles.btStatLabel}>{s.label}</div>
+                    <div className={styles.btStatValue} style={{ color: '#1E293B', fontSize: '1.2rem' }}>{s.value}</div>
+                    <div className={styles.btStatSub}>{s.sub}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Capital summary */}
+              <div style={{ display: 'flex', gap: 16, marginBottom: 16, padding: '10px 16px', background: '#F8FAFC', borderRadius: 8, border: '1px solid #E2E8F0', fontSize: 12 }}>
+                <span>Initial: <strong style={{ color: '#1E293B' }}>{fmt.currency(btSummary.initialCapital)}</strong></span>
+                <span>Final: <strong style={{ color: btSummary.finalEquity >= btSummary.initialCapital ? '#15803D' : '#DC2626' }}>{fmt.currency(btSummary.finalEquity)}</strong></span>
+                <span>P&L: <strong style={{ color: btSummary.finalEquity >= btSummary.initialCapital ? '#15803D' : '#DC2626' }}>
+                  {btSummary.finalEquity >= btSummary.initialCapital ? '+' : ''}{fmt.currency(btSummary.finalEquity - btSummary.initialCapital)}
+                </strong></span>
+                <span>Calmar: <strong>{btSummary.calmarRatio?.toFixed(2) ?? '—'}</strong></span>
+              </div>
+
+              {/* Strategy breakdown table */}
+              {btStratBreak.length > 0 && (
+                <Card title="Strategy Breakdown">
+                  <table className={styles.btTradeTable}>
+                    <thead>
+                      <tr>
+                        {['STRATEGY','TRADES','WIN RATE','AVG R','PF','T1 HIT','T2 HIT','MFE','MAE'].map(h => (
+                          <th key={h}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {btStratBreak.map((sb: any) => {
+                        const winRate = Number(sb.winRate ?? sb.win_rate ?? 0);
+                        const avgR = Number(sb.avgReturnR ?? sb.avg_return_r ?? 0);
+                        const pf = Number(sb.profitFactor ?? sb.profit_factor ?? 0);
+                        const t1Hit = Number(sb.target1HitRate ?? sb.target1_hit_rate ?? 0);
+                        const t2Hit = Number(sb.target2HitRate ?? sb.target2_hit_rate ?? 0);
+                        const mfe = Number(sb.avgMfePct ?? sb.avg_mfe_pct ?? 0);
+                        const mae = Number(sb.avgMaePct ?? sb.avg_mae_pct ?? 0);
+                        return (
+                          <tr key={sb.strategy}>
+                            <td style={{ fontWeight: 700 }}>{sb.strategy?.replace(/_/g, ' ')}</td>
+                            <td>{sb.totalTrades ?? sb.total_trades ?? 0}</td>
+                            <td style={{ color: winRate >= 0.5 ? '#15803D' : '#DC2626', fontWeight: 700 }}>
+                              {(winRate * 100).toFixed(0)}%
+                            </td>
+                            <td>{avgR.toFixed(2)}R</td>
+                            <td style={{ color: pf >= 1 ? '#15803D' : '#DC2626' }}>{pf.toFixed(2)}</td>
+                            <td>{(t1Hit * 100).toFixed(0)}%</td>
+                            <td>{(t2Hit * 100).toFixed(0)}%</td>
+                            <td style={{ color: '#15803D' }}>+{mfe.toFixed(2)}%</td>
+                            <td style={{ color: '#DC2626' }}>-{Math.abs(mae).toFixed(2)}%</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </Card>
+              )}
+
+              {/* Recent trades table */}
+              {btTrades.length > 0 && (
+                <Card title={`Recent Trades (${btTrades.length} total)`} style={{ marginTop: 16 }}>
+                  <table className={styles.btTradeTable}>
+                    <thead>
+                      <tr>
+                        {['SYMBOL','STRATEGY','DIR','ENTRY','EXIT','P&L','RETURN','R-MULT','OUTCOME','EXIT REASON'].map(h => (
+                          <th key={h}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {btTrades.slice(0, 20).map((t: any) => {
+                        // DECIMAL columns from MySQL come back as strings — coerce
+                        const pnl = Number(t.net_pnl ?? t.netPnl ?? 0);
+                        const retPct = Number(t.return_pct ?? t.returnPct ?? 0);
+                        const retR = Number(t.return_r ?? t.returnR ?? 0);
+                        const entryPrice = Number(t.entry_price ?? t.entryPrice ?? 0);
+                        const exitPrice = t.exit_price ?? t.exitPrice;
+                        const outcome = t.outcome ?? '';
+                        const isWin = outcome === 'win';
+                        return (
+                          <tr key={t.trade_id ?? t.tradeId}>
+                            <td style={{ fontWeight: 700 }}>{t.symbol}</td>
+                            <td style={{ fontSize: 11, color: '#64748B' }}>{(t.strategy ?? '').replace(/_/g, ' ')}</td>
+                            <td>
+                              <span style={{
+                                background: t.direction === 'long' ? '#DCFCE7' : '#FEE2E2',
+                                color: t.direction === 'long' ? '#15803D' : '#DC2626',
+                                fontWeight: 700, fontSize: 10, padding: '2px 6px', borderRadius: 99,
+                              }}>
+                                {(t.direction ?? '').toUpperCase()}
+                              </span>
+                            </td>
+                            <td>{fmt.currency(entryPrice)}</td>
+                            <td>{exitPrice != null ? fmt.currency(Number(exitPrice)) : '—'}</td>
+                            <td style={{ fontWeight: 700, color: pnl >= 0 ? '#15803D' : '#DC2626' }}>
+                              {pnl >= 0 ? '+' : ''}{fmt.currency(pnl)}
+                            </td>
+                            <td style={{ color: retPct >= 0 ? '#15803D' : '#DC2626' }}>
+                              {retPct >= 0 ? '+' : ''}{retPct.toFixed(2)}%
+                            </td>
+                            <td style={{ fontWeight: 600, color: retR >= 0 ? '#15803D' : '#DC2626' }}>
+                              {retR >= 0 ? '+' : ''}{retR.toFixed(2)}R
+                            </td>
+                            <td>
+                              <span style={{
+                                background: isWin ? '#DCFCE7' : '#FEE2E2',
+                                color: isWin ? '#15803D' : '#DC2626',
+                                fontWeight: 700, fontSize: 10, padding: '2px 8px', borderRadius: 99,
+                              }}>
+                                {outcome.toUpperCase()}
+                              </span>
+                            </td>
+                            <td style={{ fontSize: 11, color: '#64748B' }}>
+                              {(t.exit_reason ?? t.exitReason ?? '—').replace(/_/g, ' ')}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  {btTrades.length > 20 && (
+                    <div style={{ padding: '8px 12px', fontSize: 11, color: '#94A3B8', textAlign: 'center', borderTop: '1px solid #F1F5F9' }}>
+                      Showing 20 of {btTrades.length} trades
+                    </div>
+                  )}
+                </Card>
+              )}
+            </>
+          )}
+
+          {!btLoading && !btSummary && btRuns.length === 0 && (
+            <Card>
+              <div style={{ padding: 40, textAlign: 'center', color: '#94A3B8' }}>
+                <FlaskConical size={28} style={{ marginBottom: 8, opacity: 0.5 }} />
+                <div style={{ fontSize: 13, marginBottom: 4 }}>No backtest runs yet</div>
+                <div style={{ fontSize: 11 }}>
+                  {dataReady === 0
+                    ? 'First seed historical data above, then click "Run Backtest".'
+                    : 'Click "Run Backtest" to start your first simulation with default settings.'}
+                </div>
+              </div>
+            </Card>
+          )}
+
+          {/* Show failed runs info */}
+          {!btLoading && !btSummary && btRuns.length > 0 && (
+            <Card>
+              <div style={{ padding: 16 }}>
+                {btRuns.filter(r => r.status === 'completed').length === 0 ? (
+                  <div style={{ textAlign: 'center', color: '#D97706' }}>
+                    <AlertTriangle size={20} style={{ marginBottom: 6 }} />
+                    <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>No successful backtest runs yet</div>
+                    <div style={{ fontSize: 11, color: '#94A3B8' }}>
+                      {btRuns.map(r => (
+                        <div key={r.run_id} style={{ marginTop: 4 }}>
+                          <span style={{ fontWeight: 600 }}>{r.name}</span>
+                          {' — '}
+                          <span style={{ color: r.status === 'failed' ? '#DC2626' : '#D97706' }}>{r.status}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 11, color: '#64748B', marginTop: 8 }}>
+                      {dataReady !== null && dataReady > 0
+                        ? 'Historical data is ready. Click "Run Backtest" to try again.'
+                        : 'Seed historical data first, then run a new backtest.'}
+                    </div>
+                  </div>
+                ) : !btSelected ? (
+                  <div style={{ textAlign: 'center', color: '#94A3B8', fontSize: 12 }}>
+                    Select a backtest run above to view results.
+                  </div>
+                ) : null}
+              </div>
+            </Card>
+          )}
         </section>
 
       </div>

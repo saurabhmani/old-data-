@@ -19,6 +19,16 @@ export class AuditLogger {
     this.maxEntries = maxEntries;
   }
 
+  /**
+   * Build a logger pre-loaded with the given entries — used by the
+   * orchestrator to persist entries that were collected during a run.
+   */
+  static fromEntries(runId: string, entries: BacktestAuditEntry[], maxEntries = 10_000): AuditLogger {
+    const logger = new AuditLogger(runId, maxEntries);
+    logger.entries = [...entries];
+    return logger;
+  }
+
   log(
     barIndex: number,
     action: AuditAction,

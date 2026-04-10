@@ -14,20 +14,27 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { QuantSignal, StrategyName, MarketRegimeLabel } from '../../signal-engine/types/signalEngine.types';
 import type {
-  BacktestRunConfig, BacktestRunRecord, SimulatedTrade, EquityPoint,
+  BacktestRunConfig, BacktestRunRecord, SimulatedTrade, SimulatedSignal, EquityPoint,
   OpenPosition, PendingSignal, TradeDirection, BacktestSummary,
-  StrategyBreakdownResult, RegimeBreakdownResult,
+  StrategyBreakdownResult, RegimeBreakdownResult, BacktestAuditEntry,
 } from '../types';
 
-/** Full backtest result including data arrays (not persisted in run record) */
+/**
+ * Full backtest result — the in-memory truth chain produced by a single run.
+ * Every field that needs to be persisted is exposed here so the orchestrator
+ * never has to reconstruct anything.
+ */
 export interface BacktestRunResult extends BacktestRunRecord {
   trades: SimulatedTrade[];
   equityCurve: EquityPoint[];
+  signals: SimulatedSignal[];
+  auditEntries: BacktestAuditEntry[];
 }
 import { validateBacktestConfig } from '../utils/validation';
 import { preloadCandleData } from '../data/historicalCandleProvider';
 import { generatePhase1Signals } from '../../signal-engine/pipeline/generatePhase1Signals';
 import { getSector } from '../../signal-engine/constants/phase3.constants';
+import { AuditLogger } from '../repository/auditLogger';
 import {
   checkEntryTrigger, checkExit, updateExcursions,
   calculateBacktestPositionSize, closePosition,
@@ -44,17 +51,36 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
   const runId = config.runId || uuidv4();
   const startedAt = new Date().toISOString();
 
-  // Validate config
+  // Audit logger is created FIRST so every phase boundary is captured,
+  // including config validation and data loading. lastSuccessfulStep is
+  // tracked so failed runs surface where they died.
+  const audit = new AuditLogger(runId);
+  let lastSuccessfulStep = 'created';
+
+  audit.log(0, 'run_started', `Backtest started: ${config.name}`, null, {
+    universe: config.universe.length,
+    startDate: config.startDate,
+    endDate: config.endDate,
+    initialCapital: config.initialCapital,
+    fillModel: config.fillModel,
+    warmupBars: config.warmupBars,
+  });
+
+  // ── Phase 1: Validate config ────────────────────────────
   const validation = validateBacktestConfig(config);
   if (!validation.valid) {
-    return createFailedRun(runId, config, startedAt, `Config validation failed: ${validation.errors.join(', ')}`);
+    audit.log(0, 'run_failed', `Config validation failed: ${validation.errors.join(', ')}`, null,
+      { errors: validation.errors, lastSuccessfulStep });
+    return createFailedRun(runId, config, startedAt, `Config validation failed: ${validation.errors.join(', ')}`, audit.getEntries(), lastSuccessfulStep);
   }
+  audit.log(0, 'config_validated', `Config validated successfully`, null, {});
+  lastSuccessfulStep = 'config_validated';
 
   console.log(`[Backtest] Starting run ${runId}: ${config.name}`);
   console.log(`[Backtest] Universe: ${config.universe.length} symbols, ${config.startDate} to ${config.endDate}`);
 
   try {
-    // ── Step 1: Preload all candle data ─────────────────────
+    // ── Phase 2: Preload all candle data ────────────────────
     console.log('[Backtest] Preloading candle data...');
     const allSymbols = [...config.universe, config.benchmarkSymbol];
     const dataStore = await preloadCandleData(allSymbols, config.startDate, config.endDate);
@@ -62,16 +88,24 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
     console.log(`[Backtest] Loaded ${dataStore.candlesLoaded} candles for ${dataStore.symbolsLoaded} symbols`);
     console.log(`[Backtest] ${dataStore.tradingDates.length} trading dates in range`);
 
+    audit.log(0, 'data_loaded', `Loaded ${dataStore.candlesLoaded} candles for ${dataStore.symbolsLoaded} symbols`, null, {
+      candles: dataStore.candlesLoaded,
+      symbols: dataStore.symbolsLoaded,
+      tradingDates: dataStore.tradingDates.length,
+    });
+    lastSuccessfulStep = 'data_loaded';
+
     if (dataStore.tradingDates.length === 0) {
-      return createFailedRun(runId, config, startedAt, 'No trading dates found in date range');
+      audit.log(0, 'run_failed', 'No trading dates found in date range', null, { lastSuccessfulStep });
+      return createFailedRun(runId, config, startedAt, 'No trading dates found in date range', audit.getEntries(), lastSuccessfulStep);
     }
 
-    // ── Step 2: Initialize state ────────────────────────────
     let equity = config.initialCapital;
     let cash = config.initialCapital;
     const openPositions: OpenPosition[] = [];
     const pendingSignals: PendingSignal[] = [];
     const allTrades: SimulatedTrade[] = [];
+    const allSignals: SimulatedSignal[] = [];
     const equityCurve: EquityPoint[] = [];
     let totalSignalsGenerated = 0;
     let peakEquity = equity;
@@ -82,8 +116,8 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
       const date = dataStore.tradingDates[dayIdx];
       const provider = dataStore.getProviderForDate(date);
 
-      // Skip warmup period (need enough data for indicators)
-      if (dayIdx < config.warmupBars - 200) continue; // rough guard
+      // Skip warmup period — indicators need sufficient historical bars
+      if (dayIdx < config.warmupBars) continue;
 
       // 3a. Process exits on open positions
       for (let i = openPositions.length - 1; i >= 0; i--) {
@@ -105,8 +139,8 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
           : (pos.entryPrice - lastCandle.close) * pos.positionSize;
         pos.barByBarPnl.push(Math.round(currentPnl * 100) / 100);
 
-        // Check exit
-        const exitResult = checkExit(pos, lastCandle, barsInTrade, config.evaluationHorizon);
+        // Check exit — fillModel drives stop/target priority on collision bars
+        const exitResult = checkExit(pos, lastCandle, barsInTrade, config.evaluationHorizon, config.fillModel);
 
         // Update target tracking even without exit
         pos.target1Hit = exitResult.target1Hit;
@@ -114,16 +148,22 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
         pos.target3Hit = exitResult.target3Hit;
 
         if (exitResult.exited) {
+          // Preserve original signal metadata (Phase 2 spec section 3) — never
+          // fall back to generic values; pos already carries the truth.
           const trade = closePosition(pos, exitResult.exitPrice, date, exitResult.exitReason, exitResult, config, {
             signalId: pos.tradeId,
             signalDate: pos.entryDate,
-            regime: 'Sideways', // stored at entry time
-            confidenceScore: 0,
-            confidenceBand: 'Watchlist',
+            regime: pos.regime,
+            confidenceScore: pos.confidenceScore,
+            confidenceBand: pos.confidenceBand,
           });
           allTrades.push(trade);
           cash += pos.positionSize * exitResult.exitPrice - config.commissionPerTrade;
           openPositions.splice(i, 1);
+
+          audit.log(dayIdx, exitResult.exitReason === 'stop_loss' ? 'exit_stop' : exitResult.exitReason?.startsWith('target') ? 'exit_target' : 'exit_expiry',
+            `Closed ${pos.symbol}: ${exitResult.exitReason} at ${exitResult.exitPrice.toFixed(2)}, PnL=${trade.netPnl.toFixed(2)}`,
+            pos.symbol, { exitReason: exitResult.exitReason, exitPrice: exitResult.exitPrice, netPnl: trade.netPnl, returnR: trade.returnR });
         }
       }
 
@@ -131,9 +171,19 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
       for (let i = pendingSignals.length - 1; i >= 0; i--) {
         const sig = pendingSignals[i];
 
+        // Helper: mark the corresponding allSignals entry with a terminal state
+        // so backtest_signals.status reflects the truth (Phase 2 spec section 5).
+        const markSignal = (status: SimulatedSignal['status']) => {
+          const sigRecord = allSignals.find(s => s.signalId === sig.signalId);
+          if (sigRecord) sigRecord.status = status;
+        };
+
         // Expire old signals
         sig.barsWaited++;
         if (sig.barsWaited > config.signalExpiryBars) {
+          markSignal('expired');
+          audit.log(dayIdx, 'signal_expired', `${sig.symbol}: expired after ${sig.barsWaited} bars`,
+            sig.symbol, { signalId: sig.signalId, barsWaited: sig.barsWaited });
           pendingSignals.splice(i, 1);
           continue;
         }
@@ -142,6 +192,23 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
         const candles = await provider.fetchDailyCandles(sig.symbol);
         const lastCandle = candles[candles.length - 1];
         if (!lastCandle || lastCandle.ts.split('T')[0] !== date) continue;
+
+        // ── Invalidation: stop hit before entry was triggered ──
+        // (Phase 2 spec section 5 — invalidated_before_entry)
+        const stopHitFirst = sig.direction === 'long'
+          ? lastCandle.low <= sig.stopLoss
+          : lastCandle.high >= sig.stopLoss;
+        const entryReachable = sig.direction === 'long'
+          ? lastCandle.low <= sig.entryZoneHigh
+          : lastCandle.high >= sig.entryZoneLow;
+
+        if (stopHitFirst && !entryReachable) {
+          markSignal('filtered');
+          audit.log(dayIdx, 'signal_filtered', `${sig.symbol}: invalidated before entry (stop hit, no entry)`,
+            sig.symbol, { signalId: sig.signalId, reason: 'invalidated_before_entry' });
+          pendingSignals.splice(i, 1);
+          continue;
+        }
 
         // Check position limits
         if (openPositions.length >= config.maxOpenPositions) continue;
@@ -196,6 +263,12 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
           barByBarPnl: [],
         });
 
+        // Mark signal as triggered (Phase 2 spec — preserve full lifecycle truth)
+        markSignal('triggered');
+
+        audit.log(dayIdx, 'entry_triggered', `Opened ${sig.symbol}: ${sig.direction} at ${entry.fillPrice.toFixed(2)}, size=${sizing.positionSize}`,
+          sig.symbol, { entryPrice: entry.fillPrice, positionSize: sizing.positionSize, strategy: sig.strategy });
+
         pendingSignals.splice(i, 1);
       }
 
@@ -215,6 +288,9 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
 
         const result = await generatePhase1Signals(provider, p1Config);
         totalSignalsGenerated += result.signals.length;
+        if (result.signals.length > 0) {
+          audit.log(dayIdx, 'signal_generated', `Generated ${result.signals.length} signals on ${date}`, null, { count: result.signals.length });
+        }
 
         // Convert signals to pending
         for (const sig of result.signals) {
@@ -225,6 +301,18 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
           if (pendingSignals.some(p => p.symbol === sig.symbol)) continue;
           if (openPositions.some(p => p.symbol === sig.symbol)) continue;
 
+          // ── Per-symbol warmup readiness gate (Phase 2 spec section 2) ──
+          // The global dayIdx warmup is necessary but not sufficient — each
+          // symbol may have started trading later in the dataset and have
+          // fewer than warmupBars of usable history. Reject under-warmed symbols.
+          const symCandles = await provider.fetchDailyCandles(sig.symbol);
+          if (symCandles.length < config.warmupBars) {
+            audit.log(dayIdx, 'signal_filtered',
+              `${sig.symbol}: under-warmed (${symCandles.length}/${config.warmupBars} bars)`,
+              sig.symbol, { reason: 'insufficient_history', barsAvailable: symCandles.length, required: config.warmupBars });
+            continue;
+          }
+
           // R:R check
           if (sig.rewardRiskApprox < config.minRewardRisk) continue;
 
@@ -233,26 +321,61 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
           if (stopWidth > config.maxStopWidthPct) continue;
 
           signalCounter++;
+          const signalId = `${runId}-${signalCounter}`;
           const riskPerUnit = Math.abs(sig.entry.zoneHigh - sig.stopLoss);
+          const direction = (sig.signalType === 'bearish_breakdown' ? 'short' : 'long') as TradeDirection;
+          const strategy = sig.signalType as StrategyName;
+          const sector = getSector(sig.symbol);
           const t3 = sig.signalType === 'bearish_breakdown'
             ? sig.entry.zoneHigh - 3.5 * riskPerUnit
             : sig.entry.zoneHigh + 3.5 * riskPerUnit;
+          const target3 = Math.round(t3 * 100) / 100;
 
-          pendingSignals.push({
-            signalId: `${runId}-${signalCounter}`,
+          // Capture full signal for persistence and audit
+          allSignals.push({
+            signalId,
             symbol: sig.symbol,
-            direction: (sig.signalType === 'bearish_breakdown' ? 'short' : 'long') as TradeDirection,
-            strategy: sig.signalType as StrategyName,
+            date,
+            barIndex: dayIdx,
+            direction,
+            strategy,
             regime: sig.marketRegime,
             confidenceScore: sig.confidenceScore,
             confidenceBand: sig.confidenceBand,
-            sector: getSector(sig.symbol),
+            riskScore: sig.riskScore,
+            sector,
             entryZoneLow: sig.entry.zoneLow,
             entryZoneHigh: sig.entry.zoneHigh,
             stopLoss: sig.stopLoss,
             target1: sig.targets.target1,
             target2: sig.targets.target2,
-            target3: Math.round(t3 * 100) / 100,
+            target3,
+            riskPerUnit,
+            rewardRiskApprox: sig.rewardRiskApprox,
+            reasons: sig.reasons,
+            warnings: sig.warnings,
+            status: 'pending',
+            barsWaited: 0,
+            expiryDate: null,
+            featuresSnapshot: sig.features,
+            confidenceBreakdown: sig.confidenceBreakdown,
+          });
+
+          pendingSignals.push({
+            signalId,
+            symbol: sig.symbol,
+            direction,
+            strategy,
+            regime: sig.marketRegime,
+            confidenceScore: sig.confidenceScore,
+            confidenceBand: sig.confidenceBand,
+            sector,
+            entryZoneLow: sig.entry.zoneLow,
+            entryZoneHigh: sig.entry.zoneHigh,
+            stopLoss: sig.stopLoss,
+            target1: sig.targets.target1,
+            target2: sig.targets.target2,
+            target3,
             riskPerUnit,
             signalDate: date,
             signalBarIndex: dayIdx,
@@ -305,20 +428,61 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
         target3Hit: pos.target3Hit, stopHit: false,
       }, config, {
         signalId: pos.tradeId, signalDate: pos.entryDate,
-        regime: 'Sideways', confidenceScore: 0, confidenceBand: 'Watchlist',
+        // Preserve original signal metadata (Phase 2 spec section 3)
+        regime: pos.regime,
+        confidenceScore: pos.confidenceScore,
+        confidenceBand: pos.confidenceBand,
       });
       allTrades.push(trade);
     }
 
-    // ── Step 5: Compute all metrics ─────────────────────────
+    // ── Phase 4: Simulation complete ─────────────────────────
+    audit.log(dataStore.tradingDates.length - 1, 'simulation_completed',
+      `Simulation complete: ${allTrades.length} trades from ${allSignals.length} signals`,
+      null, {
+        trades: allTrades.length,
+        signals: allSignals.length,
+        equityPoints: equityCurve.length,
+        forceClosedAtEnd: openPositions.length,
+      });
+    lastSuccessfulStep = 'simulation_completed';
+
+    // ── Phase 5: Compute all metrics ────────────────────────
     const summary = computeBacktestSummary(allTrades, equityCurve, config, totalSignalsGenerated);
     const strategyBreakdown = computeStrategyBreakdown(allTrades);
     const regimeBreakdown = computeRegimeBreakdown(allTrades);
 
-    console.log(`[Backtest] Complete — ${allTrades.length} trades, ${summary.winRate * 100}% win rate, ${summary.totalReturnPct}% return`);
+    audit.log(dataStore.tradingDates.length - 1, 'metrics_computed',
+      `Metrics computed: ${(summary.winRate * 100).toFixed(0)}% win rate, ${summary.totalReturnPct.toFixed(2)}% return`,
+      null, {
+        winRate: summary.winRate,
+        profitFactor: summary.profitFactor,
+        totalReturnPct: summary.totalReturnPct,
+        maxDrawdownPct: summary.maxDrawdownPct,
+      });
+    lastSuccessfulStep = 'metrics_computed';
+
+    audit.log(dataStore.tradingDates.length - 1, 'run_completed',
+      `Backtest complete: ${allSignals.length} signals, ${allTrades.length} trades, ${(summary.winRate * 100).toFixed(0)}% win rate`,
+      null, { signals: allSignals.length, trades: allTrades.length, winRate: summary.winRate, totalReturn: summary.totalReturnPct, lastSuccessfulStep });
+
+    // Audit entries are returned in the result so the orchestrator can persist
+    // them in the same explicit truth-chain transaction (no fire-and-forget).
+    const auditEntries = audit.getEntries();
+
+    console.log(`[Backtest] Complete — ${allSignals.length} signals, ${allTrades.length} trades, ${(summary.winRate * 100).toFixed(0)}% win rate, ${summary.totalReturnPct.toFixed(2)}% return`);
 
     const completedAt = new Date().toISOString();
     const durationMs = new Date(completedAt).getTime() - new Date(startedAt).getTime();
+
+    // Any signals still in 'pending' at run-end are either still in pending
+    // queue (force-marked as expired) or got missed because the run ended
+    // before resolution. Both are tracked as 'expired' for analytics truth.
+    for (const sig of allSignals) {
+      if (sig.status === 'pending') {
+        sig.status = 'expired';
+      }
+    }
 
     return {
       runId,
@@ -335,23 +499,50 @@ export async function runBacktest(config: BacktestRunConfig): Promise<BacktestRu
       tradeCount: allTrades.length,
       trades: allTrades,
       equityCurve,
+      signals: allSignals,
+      auditEntries,
     };
 
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[Backtest] Run failed:`, err);
-    return createFailedRun(runId, config, startedAt, message);
+    audit.log(0, 'run_failed', `Backtest failed: ${message}`, null, { error: message, lastSuccessfulStep });
+    return createFailedRun(runId, config, startedAt, message, audit.getEntries(), lastSuccessfulStep);
   }
 }
 
-function createFailedRun(runId: string, config: BacktestRunConfig, startedAt: string, error: string): BacktestRunResult {
+function createFailedRun(
+  runId: string,
+  config: BacktestRunConfig,
+  startedAt: string,
+  error: string,
+  existingAudit: BacktestAuditEntry[] = [],
+  lastSuccessfulStep: string | null = null,
+): BacktestRunResult {
+  // If no audit entries provided, emit a synthetic failure event so the
+  // failure is itself part of the persisted truth chain (spec section 7).
+  const failureAudit: BacktestAuditEntry[] = existingAudit.length > 0 ? existingAudit : [{
+    runId,
+    timestamp: new Date().toISOString(),
+    barIndex: 0,
+    action: 'run_failed',
+    symbol: null,
+    message: `Backtest failed: ${error}`,
+    payload: {
+      error,
+      lastSuccessfulStep,
+      config: { name: config.name, startDate: config.startDate, endDate: config.endDate },
+    },
+  }];
+
   return {
     runId, config, status: 'failed', startedAt, completedAt: new Date().toISOString(),
     durationMs: 0, error,
     summary: emptySummary(config.initialCapital),
     strategyBreakdown: [], regimeBreakdown: [],
     signalCount: 0, tradeCount: 0,
-    trades: [], equityCurve: [],
+    trades: [], equityCurve: [], signals: [],
+    auditEntries: failureAudit,
   };
 }
 

@@ -96,7 +96,7 @@ export { saveBacktestMetrics, saveCalibrationSnapshots, saveSignalOutcomes, save
 export { AuditLogger } from './repository/auditLogger';
 
 // ── Migration ──────────────────────────────────────────────
-export { migrateBacktestTables } from './repository/migrate';
+export { migrateBacktestTables, ensureBacktestTables } from './repository/migrate';
 
 // ── Types ──────────────────────────────────────────────────
 export type {

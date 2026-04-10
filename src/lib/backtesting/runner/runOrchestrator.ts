@@ -1,15 +1,27 @@
 // ════════════════════════════════════════════════════════════════
-//  Run Orchestrator — Full Persistence + Metrics Pipeline
+//  Run Orchestrator — Explicit Truth-Chain Persistence
 //
-//  After a backtest completes, this module:
-//  1. Computes full performance report (Part 3 metrics)
-//  2. Runs all analytics slices
-//  3. Persists everything to the database
-//  4. Generates Dexter AI output
+//  Implements the 14-step orchestration order from Phase 1 spec:
+//   1. create run record       (in-memory, done by runner)
+//   2. load data               (done by runner)
+//   3. replay signals          (done by runner)
+//   4. simulate trades         (done by runner)
+//   5. compute outcomes        ← here
+//   6. compute metrics         ← here
+//   7. persist run             ← here
+//   8. persist generated signals
+//   9. persist trades
+//  10. persist signal outcomes
+//  11. persist metrics
+//  12. persist calibration
+//  13. persist audit events
+//  14. mark run complete       (status already 'completed' on the record)
+//
+//  EVERY artifact is passed in explicitly via BacktestRunResult.
+//  Nothing is reconstructed from disk after the fact.
 // ════════════════════════════════════════════════════════════════
 
 import type { BacktestRunResult } from './backtestRunner';
-import type { SimulatedSignal } from '../types';
 import { computeFullPerformanceReport } from '../metrics/performanceMetrics';
 import { analyzeByStrategy } from '../analytics/byStrategy';
 import { analyzeByRegime } from '../analytics/byRegime';
@@ -22,97 +34,197 @@ import {
   saveBacktestMetrics, saveCalibrationSnapshots,
   saveSignalOutcomes, saveBacktestSignals,
 } from '../repository/metricsPersistence';
+import { AuditLogger } from '../repository/auditLogger';
 import { buildDexterOutput, type DexterOutput } from '../api/dexterOutput';
+import { db } from '@/lib/db';
+import type { BacktestStatus } from '../types';
+
+/**
+ * Per-table row counts persisted in this orchestration cycle.
+ * Returned to the API caller in the POST response (spec section 6).
+ */
+export interface PersistenceSummary {
+  run: number;
+  signals: number;
+  trades: number;
+  signalOutcomes: number;
+  metrics: number;
+  calibrationBuckets: number;
+  equityCurve: number;
+  auditEvents: number;
+  errors: string[];
+}
 
 export interface OrchestratedResult {
   runId: string;
+  status: BacktestStatus;
+  signalCount: number;
+  tradeCount: number;
+  durationMs: number | null;
+  persistenceSummary: PersistenceSummary;
+  // Backwards-compatible aliases for existing API consumers
   persistedMetrics: number;
   persistedCalibrationBuckets: number;
   persistedSignals: number;
   persistedTrades: number;
-  dexterOutput: DexterOutput;
+  dexterOutput: DexterOutput | null;
 }
 
 /**
- * Persist a full backtest run with all artifacts.
- * Called after runBacktest() completes.
+ * Persist a complete backtest result. Single explicit contract: every
+ * artifact comes from the in-memory result, no implicit reconstruction.
  */
-export async function persistFullRun(
-  result: BacktestRunResult,
-  signals: SimulatedSignal[] = [],
-): Promise<OrchestratedResult> {
+export async function persistFullRun(result: BacktestRunResult): Promise<OrchestratedResult> {
   const runId = result.runId;
+  const errors: string[] = [];
+  const summary: PersistenceSummary = {
+    run: 0, signals: 0, trades: 0, signalOutcomes: 0,
+    metrics: 0, calibrationBuckets: 0, equityCurve: 0, auditEvents: 0,
+    errors,
+  };
 
-  // 1. Compute full performance report
-  const report = computeFullPerformanceReport(result.trades, signals, result.equityCurve);
+  // ── Step 5: Compute outcomes (already in result.signals + trades) ──
+  // ── Step 6: Compute metrics + analytics ────────────────────────────
+  // Failed runs may have empty data — compute defensively, never throw.
+  let report;
+  let strategyAnalytics: any[] = [];
+  let regimeAnalytics: any[] = [];
+  let sectorAnalytics: any[] = [];
+  let confidenceAnalytics: any[] = [];
+  try {
+    report = computeFullPerformanceReport(result.trades, result.signals, result.equityCurve);
+    strategyAnalytics = analyzeByStrategy(result.trades);
+    regimeAnalytics = analyzeByRegime(result.trades);
+    sectorAnalytics = analyzeBySector(result.trades);
+    confidenceAnalytics = analyzeByConfidenceBucket(result.trades);
+    analyzeByRiskBand(result.trades);
+    analyzeByHoldingPeriod(result.trades);
+  } catch (err) {
+    errors.push(`metrics_computation: ${err instanceof Error ? err.message : String(err)}`);
+    report = { flatMetrics: [], calibration: [] } as any;
+  }
 
-  // 2. Run all analytics slices
-  const strategyAnalytics = analyzeByStrategy(result.trades);
-  const regimeAnalytics = analyzeByRegime(result.trades);
-  const sectorAnalytics = analyzeBySector(result.trades);
-  const confidenceAnalytics = analyzeByConfidenceBucket(result.trades);
-  const riskAnalytics = analyzeByRiskBand(result.trades);
-  const holdingAnalytics = analyzeByHoldingPeriod(result.trades);
-
-  // 3. Build Dexter AI output
-  const dexterOutput = buildDexterOutput(
-    result, report, strategyAnalytics, regimeAnalytics,
-    sectorAnalytics, confidenceAnalytics,
-  );
-
-  // 4. Persist run record + trades + equity curve
+  // ── Step 7: Persist run record + Step 9: trades + equity curve ────
+  // (saveBacktestRun handles run, trades, and equity_curve in one call)
   try {
     await saveBacktestRun(result, result.trades, result.equityCurve);
+    summary.run = 1;
+    summary.trades = result.trades.length;
+    summary.equityCurve = result.equityCurve.length;
   } catch (err) {
-    console.error(`[Orchestrator] Failed to save run ${runId}:`, err);
+    const msg = `saveBacktestRun: ${err instanceof Error ? err.message : String(err)}`;
+    errors.push(msg);
+    console.error(`[Orchestrator] ${msg}`);
   }
 
-  // 5. Persist metrics
-  let persistedMetrics = 0;
+  // ── Step 8: Persist generated signals ──────────────────────────────
+  if (result.signals.length > 0) {
+    try {
+      await saveBacktestSignals(runId, result.signals);
+      summary.signals = result.signals.length;
+    } catch (err) {
+      const msg = `saveBacktestSignals: ${err instanceof Error ? err.message : String(err)}`;
+      errors.push(msg);
+      console.error(`[Orchestrator] ${msg}`);
+    }
+  }
+
+  // ── Step 10: Persist signal outcomes ───────────────────────────────
+  if (result.signals.length > 0) {
+    try {
+      await saveSignalOutcomes(runId, result.signals, result.trades);
+      summary.signalOutcomes = result.signals.length;
+    } catch (err) {
+      const msg = `saveSignalOutcomes: ${err instanceof Error ? err.message : String(err)}`;
+      errors.push(msg);
+      console.error(`[Orchestrator] ${msg}`);
+    }
+  }
+
+  // ── Step 11: Persist metrics ───────────────────────────────────────
   try {
     await saveBacktestMetrics(runId, report.flatMetrics);
-    persistedMetrics = report.flatMetrics.length;
+    summary.metrics = report.flatMetrics.length;
   } catch (err) {
-    console.error(`[Orchestrator] Failed to save metrics:`, err);
+    const msg = `saveBacktestMetrics: ${err instanceof Error ? err.message : String(err)}`;
+    errors.push(msg);
+    console.error(`[Orchestrator] ${msg}`);
   }
 
-  // 6. Persist calibration
-  let persistedCalibration = 0;
+  // ── Step 12: Persist calibration ──────────────────────────────────
   try {
     await saveCalibrationSnapshots(runId, report.calibration);
-    persistedCalibration = report.calibration.length;
+    summary.calibrationBuckets = report.calibration.length;
   } catch (err) {
-    console.error(`[Orchestrator] Failed to save calibration:`, err);
+    const msg = `saveCalibrationSnapshots: ${err instanceof Error ? err.message : String(err)}`;
+    errors.push(msg);
+    console.error(`[Orchestrator] ${msg}`);
   }
 
-  // 7. Persist signals
-  let persistedSignals = 0;
-  try {
-    if (signals.length > 0) {
-      await saveBacktestSignals(runId, signals);
-      persistedSignals = signals.length;
+  // ── Step 13: Persist audit events ─────────────────────────────────
+  if (result.auditEntries && result.auditEntries.length > 0) {
+    try {
+      const audit = AuditLogger.fromEntries(runId, result.auditEntries);
+      await audit.persist();
+      summary.auditEvents = result.auditEntries.length;
+    } catch (err) {
+      const msg = `audit.persist: ${err instanceof Error ? err.message : String(err)}`;
+      errors.push(msg);
+      console.error(`[Orchestrator] ${msg}`);
     }
-  } catch (err) {
-    console.error(`[Orchestrator] Failed to save signals:`, err);
   }
 
-  // 8. Persist signal outcomes
-  try {
-    if (signals.length > 0) {
-      await saveSignalOutcomes(runId, signals, result.trades);
+  // ── Step 14: Build Dexter output (run is already marked complete) ──
+  // Skip on failed runs — there's nothing to verdict on.
+  let dexterOutput: DexterOutput | null = null;
+  if (result.status === 'completed' && result.trades.length > 0) {
+    try {
+      dexterOutput = buildDexterOutput(
+        result, report, strategyAnalytics, regimeAnalytics,
+        sectorAnalytics, confidenceAnalytics,
+      );
+    } catch (err) {
+      errors.push(`buildDexterOutput: ${err instanceof Error ? err.message : String(err)}`);
     }
-  } catch (err) {
-    console.error(`[Orchestrator] Failed to save outcomes:`, err);
   }
 
-  console.log(`[Orchestrator] ${runId}: ${persistedMetrics} metrics, ${persistedCalibration} calibration, ${persistedSignals} signals persisted`);
+  // ── Final status determination ────────────────────────────────────
+  // If the run completed but persistence had any errors, degrade to
+  // partial_success so consumers can tell something went wrong while
+  // still being able to use the persisted artifacts.
+  let finalStatus: BacktestStatus = result.status;
+  if (result.status === 'completed' && errors.length > 0) {
+    finalStatus = 'partial_success';
+    // Update the persisted run record with the degraded status
+    try {
+      await db.query(
+        `UPDATE backtest_runs SET status = ?, error = ? WHERE run_id = ?`,
+        ['partial_success', `Persistence errors: ${errors.join(' | ')}`, runId],
+      );
+    } catch (err) {
+      console.error('[Orchestrator] Failed to update status to partial_success:', err);
+    }
+  }
+
+  console.log(
+    `[Orchestrator] ${runId}: status=${finalStatus} ` +
+    `run=${summary.run} signals=${summary.signals} trades=${summary.trades} ` +
+    `outcomes=${summary.signalOutcomes} metrics=${summary.metrics} ` +
+    `calib=${summary.calibrationBuckets} equity=${summary.equityCurve} audit=${summary.auditEvents} ` +
+    `errors=${errors.length}`,
+  );
 
   return {
     runId,
-    persistedMetrics,
-    persistedCalibrationBuckets: persistedCalibration,
-    persistedSignals,
-    persistedTrades: result.trades.length,
+    status: finalStatus,
+    signalCount: result.signalCount,
+    tradeCount: result.tradeCount,
+    durationMs: result.durationMs,
+    persistenceSummary: summary,
+    persistedMetrics: summary.metrics,
+    persistedCalibrationBuckets: summary.calibrationBuckets,
+    persistedSignals: summary.signals,
+    persistedTrades: summary.trades,
     dexterOutput,
   };
 }

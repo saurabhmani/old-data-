@@ -54,9 +54,58 @@ export async function saveSignalOutcomes(
   const tradeBySignal = new Map<string, SimulatedTrade>();
   for (const t of trades) tradeBySignal.set(t.signalId, t);
 
+  // Lazy import to avoid circular deps
+  const { getPostSignalCandles } = await import('../data/historicalCandleProvider');
+
   for (const sig of signals) {
     const trade = tradeBySignal.get(sig.signalId);
     const triggered = sig.status === 'triggered' || !!trade;
+
+    // ── Compute return_bar5_pct and return_bar10_pct (Phase 3 spec §2) ──
+    // Pull the next 10 bars after the signal date and compute return from
+    // signal-date close (or entryZoneHigh as a proxy) to bar+5/+10 close.
+    let returnBar5Pct: number | null = null;
+    let returnBar10Pct: number | null = null;
+    try {
+      const postBars = await getPostSignalCandles(sig.symbol, sig.date, 11);
+      if (postBars.length > 0) {
+        const refPrice = sig.entryZoneHigh; // best proxy for what we'd have paid
+        const directionMult = sig.direction === 'short' ? -1 : 1;
+
+        if (postBars.length >= 5) {
+          const bar5Close = postBars[4].close;
+          returnBar5Pct = refPrice > 0
+            ? Math.round(((bar5Close - refPrice) / refPrice) * 100 * directionMult * 10000) / 10000
+            : null;
+        }
+        if (postBars.length >= 10) {
+          const bar10Close = postBars[9].close;
+          returnBar10Pct = refPrice > 0
+            ? Math.round(((bar10Close - refPrice) / refPrice) * 100 * directionMult * 10000) / 10000
+            : null;
+        }
+      }
+    } catch {
+      // If post-signal candles unavailable, leave nulls — outcome row still
+      // captures everything else.
+    }
+
+    // ── Outcome label — richer than before (Phase 3 spec §2) ──
+    let outcomeLabel: string;
+    if (trade) {
+      // Trade exists — derive label from exit reason + result
+      if (trade.target3Hit) outcomeLabel = 'good_followthrough';
+      else if (trade.target2Hit || trade.target1Hit) outcomeLabel = 'partial_success';
+      else if (trade.stopHit) outcomeLabel = 'stopped_out';
+      else if (trade.outcome === 'win') outcomeLabel = 'good_followthrough';
+      else outcomeLabel = 'expired_no_resolution';
+    } else if (sig.status === 'filtered') {
+      outcomeLabel = 'invalidated_before_entry';
+    } else if (sig.status === 'expired') {
+      outcomeLabel = 'stale_no_trigger';
+    } else {
+      outcomeLabel = 'expired_no_resolution';
+    }
 
     await db.query(
       `INSERT INTO backtest_signal_outcomes
@@ -77,11 +126,9 @@ export async function saveSignalOutcomes(
         trade?.stopHit ? 1 : 0,
         trade?.mfePct ?? 0,
         trade?.maePct ?? 0,
-        null, // returnAtBar5 — computed from bar-by-bar PnL if available
-        null,
-        trade ? trade.outcome
-          : sig.status === 'expired' ? 'stale_no_trigger'
-          : 'expired_no_resolution',
+        returnBar5Pct,
+        returnBar10Pct,
+        outcomeLabel,
       ],
     );
   }
@@ -121,7 +168,7 @@ export async function loadBacktestMetrics(runId: string): Promise<BacktestMetric
      FROM backtest_metrics WHERE run_id = ? ORDER BY category, metric_key`,
     [runId],
   );
-  const rows = Array.isArray(result) ? result : (result.rows ?? []);
+  const rows = result.rows ?? [];
   return rows.map((r: any) => ({
     metricKey: r.metric_key, metricValue: Number(r.metric_value),
     metricUnit: r.metric_unit, category: r.category, description: r.description,
@@ -134,7 +181,7 @@ export async function loadCalibrationSnapshots(runId: string): Promise<Calibrati
     `SELECT * FROM calibration_snapshots WHERE run_id = ? ORDER BY bucket`,
     [runId],
   );
-  const rows = Array.isArray(result) ? result : (result.rows ?? []);
+  const rows = result.rows ?? [];
   return rows.map((r: any) => ({
     bucket: r.bucket, strategy: r.strategy, regime: r.regime,
     sampleSize: r.sample_size, expectedHitRate: Number(r.expected_hit_rate),

@@ -129,11 +129,23 @@ export function getDb(): mysql.Pool {
 }
 
 export const db = {
-  query: async <T = any>(text: string, params?: any[]): Promise<{ rows: T[] }> => {
+  query: async <T = any>(text: string, params?: any[]): Promise<{ rows: T[]; insertId?: number; affectedRows?: number }> => {
     const p = getDb();
 
     if (/INSERT\s+INTO[\s\S]*RETURNING/i.test(text)) {
       return handleReturning(p, text, params || []) as Promise<{ rows: T[] }>;
+    }
+
+    // For INSERT/UPDATE/DELETE, extract metadata from ResultSetHeader
+    if (/^\s*(INSERT|UPDATE|DELETE|REPLACE)\s/i.test(text)) {
+      const [mysqlSql, mysqlParams] = prepareSql(text, params);
+      const [result] = await p.query(mysqlSql, mysqlParams);
+      const header = result as unknown as ResultSetHeader;
+      return {
+        rows: [] as T[],
+        insertId: header.insertId ?? undefined,
+        affectedRows: header.affectedRows ?? undefined,
+      };
     }
 
     const { rows } = await executeQuery(p, text, params);

@@ -312,15 +312,17 @@ export async function generatePhase2Signals(
 
   // ── Step 4: Persist ───────────────────────────────────────
   try {
-    await saveSignals(ranked);
+    const signalIdMap = await saveSignals(ranked);
 
-    // Save breakdowns and conflicts for audit
+    // Save breakdowns and conflicts for audit — now using REAL signal IDs
     for (const signal of ranked) {
       if (signal.strategyBreakdowns?.length > 0) {
-        try {
-          // signalId would be set after saveSignals — for now log
-          await saveStrategyBreakdowns(0, signal.strategyBreakdowns);
-        } catch {}
+        const realId = signalIdMap.get(signal.symbol);
+        if (realId) {
+          try {
+            await saveStrategyBreakdowns(realId, signal.strategyBreakdowns);
+          } catch {}
+        }
       }
     }
     for (const conflict of allConflicts) {

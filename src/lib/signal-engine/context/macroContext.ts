@@ -35,7 +35,7 @@ export function buildMacroContext(regime: EnhancedMarketRegime, sectorLeadership
   };
 }
 
-// ── Default News Context (no news) ──────────────────────────
+// ── Default News Context (fallback when no news available) ──
 
 export function defaultNewsContext(): NewsContext {
   return {
@@ -46,6 +46,95 @@ export function defaultNewsContext(): NewsContext {
     eventTags: [],
     headline: null,
   };
+}
+
+// ── Live News Context (from RSS feeds via internal API) ─────
+
+const BULLISH_KEYWORDS = ['rally', 'surge', 'soar', 'jump', 'gain', 'upgrade', 'bullish', 'record high', 'outperform', 'breakout', 'strong buy', 'beat estimate'];
+const BEARISH_KEYWORDS = ['crash', 'plunge', 'drop', 'fall', 'downgrade', 'bearish', 'sell-off', 'selloff', 'warning', 'cut', 'miss estimate', 'default', 'fraud', 'scam'];
+const EVENT_KEYWORDS: Record<string, EventTag> = {
+  'earnings': 'earnings_within_3_days',
+  'results': 'earnings_within_3_days',
+  'quarterly': 'earnings_within_3_days',
+  'rbi': 'policy_decision_today',
+  'fed': 'policy_decision_today',
+  'rate decision': 'policy_decision_today',
+  'gdp': 'macro_data_release_today',
+  'inflation': 'macro_data_release_today',
+  'cpi': 'macro_data_release_today',
+  'sebi': 'regulatory_decision',
+  'dividend': 'corporate_action',
+  'split': 'corporate_action',
+  'buyback': 'corporate_action',
+  'ceo': 'management_event',
+  'resignation': 'management_event',
+};
+
+/**
+ * Build NewsContext from actual news articles.
+ * Pass an array of recent headlines/titles fetched from /api/news or RSS.
+ */
+export function buildNewsContext(articles: Array<{ title: string; published_at?: string; source?: string }>): NewsContext {
+  if (!articles.length) return defaultNewsContext();
+
+  let bullishCount = 0;
+  let bearishCount = 0;
+  const detectedTags: EventTag[] = [];
+  const latestHeadline = articles[0]?.title ?? null;
+
+  for (const article of articles) {
+    const lower = (article.title ?? '').toLowerCase();
+    for (const kw of BULLISH_KEYWORDS) { if (lower.includes(kw)) bullishCount++; }
+    for (const kw of BEARISH_KEYWORDS) { if (lower.includes(kw)) bearishCount++; }
+    for (const [kw, tag] of Object.entries(EVENT_KEYWORDS)) {
+      if (lower.includes(kw) && !detectedTags.includes(tag)) detectedTags.push(tag);
+    }
+  }
+
+  const total = bullishCount + bearishCount;
+  const bias: NewsContext['bias'] = total === 0 ? 'neutral' : bullishCount > bearishCount * 1.5 ? 'positive' : bearishCount > bullishCount * 1.5 ? 'negative' : 'neutral';
+  const strength = Math.min(100, total * 10);
+
+  // Freshness from latest article
+  let freshnessHours = 999;
+  if (articles[0]?.published_at) {
+    const diff = Date.now() - new Date(articles[0].published_at).getTime();
+    freshnessHours = Math.round(diff / (1000 * 60 * 60));
+  }
+
+  return {
+    bias,
+    strength,
+    freshnessHours,
+    sourceConfidence: articles.length >= 5 ? 70 : articles.length >= 2 ? 50 : 30,
+    eventTags: detectedTags,
+    headline: latestHeadline,
+  };
+}
+
+/**
+ * Fetch real news context by calling the internal API.
+ * Falls back to defaultNewsContext() on failure.
+ */
+export async function fetchLiveNewsContext(): Promise<NewsContext> {
+  try {
+    const { db } = await import('@/lib/db');
+
+    // Pull recent news from DB (last 24h)
+    const { rows } = await db.query(
+      `SELECT title, published_at FROM news
+       WHERE is_published = TRUE AND published_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+       ORDER BY published_at DESC LIMIT 20`,
+    );
+
+    if (rows.length > 0) {
+      return buildNewsContext(rows as any[]);
+    }
+
+    return defaultNewsContext();
+  } catch {
+    return defaultNewsContext();
+  }
 }
 
 // ── Event Risk from Context ─────────────────────────────────

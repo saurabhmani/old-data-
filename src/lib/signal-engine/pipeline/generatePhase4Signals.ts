@@ -18,13 +18,16 @@ import { DEFAULT_PHASE1_CONFIG } from '../constants/signalEngine.constants';
 import { DEFAULT_PHASE3_CONFIG } from '../constants/phase3.constants';
 import { generatePhase3Signals } from './generatePhase3Signals';
 import type { Phase3Result } from './generatePhase3Signals';
-import { buildMacroContext, defaultNewsContext, computeEventRisk } from '../context/macroContext';
+import { buildMacroContext, defaultNewsContext, fetchLiveNewsContext, computeEventRisk } from '../context/macroContext';
 import { computeContextualModifiers } from '../context/contextualModifiers';
 import { computeFreshness } from '../freshness/signalDecay';
 import { buildExplanation, buildTraderNarrative } from '../ai-explain/buildExplanation';
 import { defaultFeedbackState } from '../feedback/outcomeTracker';
 import { buildPortfolioCommentary, createMemoryEntry } from '../memory/decisionMemory';
-import { saveExplanation, savePortfolioCommentary as persistCommentary } from '../repository/savePhase4Artifacts';
+import { saveExplanation, savePortfolioCommentary as persistCommentary, saveDecisionMemory } from '../repository/savePhase4Artifacts';
+import { saveSignals } from '../repository/saveSignals';
+import { savePhase3Artifacts } from '../repository/savePhase3Signals';
+import { buildSignalTimeline } from '../memory/decisionMemory';
 import type { CandleProvider } from './generatePhase1Signals';
 import type { StrategyName } from '../types/signalEngine.types';
 
@@ -68,7 +71,8 @@ export async function generatePhase4Signals(
 
   // ── Build macro context from regime + sector leadership ───
   const macro = buildMacroContext(phase3.regime, leadingSectors);
-  const news = defaultNewsContext(); // Wire to real news API when available
+  // Fetch real news from DB (falls back to default if unavailable)
+  const news = await fetchLiveNewsContext();
   const eventRisk = computeEventRisk(eventTags);
 
   // ── Enrich each signal ────────────────────────────────────
@@ -158,14 +162,69 @@ export async function generatePhase4Signals(
     portfolio, phase3.regime, phase3.approved, phase3.deferred,
   );
 
-  // ── Persist Phase 4 artifacts ──────────────────────────────
+  // ── Persist signals first to get real IDs, then save explanations ──
   try {
+    // Save base signals (Phase 3 data) to get real DB IDs
+    const signalIdMap = await saveSignals(enriched.map(sig => ({
+      symbol: sig.symbol,
+      timeframe: 'daily' as const,
+      signalType: sig.signalType,
+      signalSubtype: sig.signalSubtype ?? 'primary',
+      action: sig.executionReadiness.approvalDecision === 'approved' ? 'BUY' : 'WATCH',
+      marketRegime: sig.marketRegime,
+      marketContextTag: 'normal',
+      strengthTag: 'moderate',
+      strategyName: sig.signalType,
+      strategyConfidence: sig.confidenceScore,
+      contextScore: 0,
+      confidenceScore: sig.adjustedConfidenceScore,
+      confidenceBand: sig.confidenceBand,
+      riskScore: sig.riskScore,
+      riskBand: sig.riskScore <= 30 ? 'Low' : sig.riskScore <= 60 ? 'Medium' : 'High',
+      entry: { type: 'breakout_confirmation' as const, zoneLow: sig.tradePlan.entryZoneLow, zoneHigh: sig.tradePlan.entryZoneHigh },
+      stopLoss: sig.tradePlan.stopLoss,
+      targets: { target1: sig.tradePlan.target1, target2: sig.tradePlan.target2 },
+      rewardRiskApprox: sig.tradePlan.rrTarget1,
+      reasons: sig.reasons,
+      warnings: sig.warnings,
+      features: {} as any,
+      relativeStrength: {} as any,
+      confidenceBreakdown: {} as any,
+      riskBreakdown: {} as any,
+      status: sig.executionReadiness.approvalDecision === 'approved' ? 'active' : 'watchlist',
+      generatedAt: sig.generatedAt,
+    } as any)));
+
+    // Now save Phase 3 artifacts + explanations with REAL signal IDs
     for (const sig of enriched) {
-      await saveExplanation(
-        0, // signalId — would be set after Phase 3 persistence
-        sig.aiExplanation as unknown as Record<string, unknown>,
-        { macro: sig.macroContext, news: sig.newsContext, eventRisk: sig.eventRisk, modifiers: sig.contextualModifiers } as Record<string, unknown>,
-      ).catch(() => {});
+      const realId = signalIdMap.get(sig.symbol);
+      if (realId) {
+        // Phase 3 artifacts
+        await savePhase3Artifacts(
+          realId,
+          sig.tradePlan,
+          sig.positionSizing,
+          sig.portfolioFit,
+          sig.executionReadiness,
+          { state: sig.lifecycleStatus as any, reason: 'phase4_generated', changedAt: sig.generatedAt },
+        ).catch((err) => console.error(`[Phase4] Phase3 artifacts save failed for ${sig.symbol}:`, err));
+
+        // AI explanation
+        await saveExplanation(
+          realId,
+          sig.aiExplanation as unknown as Record<string, unknown>,
+          { macro: sig.macroContext, news: sig.newsContext, eventRisk: sig.eventRisk, modifiers: sig.contextualModifiers } as Record<string, unknown>,
+        ).catch(() => {});
+
+        // Decision memory — audit trail of why signal was generated
+        const timeline = buildSignalTimeline(realId, [
+          { stage: 'phase1_scan', message: `Signal detected: ${sig.signalType} for ${sig.symbol}` },
+          { stage: 'phase2_strategy', message: `Strategy: ${sig.signalType}, confidence: ${sig.confidenceScore}` },
+          { stage: 'phase3_execution', message: `Approval: ${sig.executionReadiness.approvalDecision}, fit: ${sig.portfolioFit.fitScore}`, payload: { sizing: sig.positionSizing.positionSizeUnits, risk: sig.riskScore } },
+          { stage: 'phase4_enrichment', message: `Adjusted confidence: ${sig.adjustedConfidenceScore}, band: ${sig.confidenceBand}`, payload: { freshness: sig.freshness.decayState, eventRisk: sig.eventRisk.eventRiskScore } },
+        ]);
+        await saveDecisionMemory(timeline).catch(() => {});
+      }
     }
     await persistCommentary(commentary).catch(() => {});
   } catch (err) {

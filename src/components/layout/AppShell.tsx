@@ -6,7 +6,7 @@ import {
   LayoutDashboard, TrendingUp, Search, Star, Briefcase,
   Newspaper, Bell, FileText, Settings, Users, Database,
   ClipboardList, Menu, X, LogOut, Activity,
-  Zap, Target, Brain, BookOpen, LineChart,
+  Zap, Target, Brain, BookOpen, LineChart, FlaskConical, ShieldAlert,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { fmt } from '@/lib/utils';
@@ -38,11 +38,13 @@ const NAV: NavGroup[] = [
   {
     label: 'Intelligence',
     items: [
-      { href: '/intelligence',   icon: Brain,     label: 'Intelligence Hub' },
-      { href: '/signals',        icon: Zap,       label: 'Signals' },
-      { href: '/trade-setups',   icon: Target,    label: 'Trade Setups' },
-      { href: '/options/chain',  icon: LineChart,  label: 'Option Intelligence' },
-      { href: '/trade-journal',  icon: BookOpen,  label: 'Trade Journal' },
+      { href: '/intelligence',   icon: Brain,        label: 'Intelligence Hub' },
+      { href: '/signals',        icon: Zap,          label: 'Signals' },
+      { href: '/trade-setups',   icon: Target,       label: 'Trade Setups' },
+      { href: '/options/chain',  icon: LineChart,    label: 'Option Intelligence' },
+      { href: '/trade-journal',  icon: BookOpen,     label: 'Trade Journal' },
+      { href: '/backtesting',    icon: FlaskConical, label: 'Backtesting' },
+      { href: '/manipulation',   icon: ShieldAlert,  label: 'Manipulation Watch' },
     ],
   },
   {

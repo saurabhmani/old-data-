@@ -12,6 +12,26 @@ import type {
   TradeOutcome, ExitReason, TradeDirection,
 } from '../types';
 import { getSector } from '../../signal-engine/constants/phase3.constants';
+import type { IntraBarAssumption } from '../utils/barExecution';
+import { getIntraBarPricePath } from '../utils/barExecution';
+
+/**
+ * Map the user-facing fillModel to the bar execution path assumption.
+ * - conservative → stop wins on collisions (worst-case fill)
+ * - midpoint     → uses the OHLC ordering of the actual bar (close direction)
+ * - aggressive   → target wins on collisions (best-case fill)
+ */
+function fillModelToAssumption(fillModel: string | undefined): IntraBarAssumption {
+  switch (fillModel) {
+    case 'aggressive':
+      return 'optimistic';
+    case 'midpoint':
+      return 'open_to_high_to_low_to_close';
+    case 'conservative':
+    default:
+      return 'conservative';
+  }
+}
 
 // ── Entry trigger check ────────────────────────────────────
 
@@ -85,11 +105,28 @@ export interface ExitResult {
  *   - Stop hit if high >= stopLoss
  *   - Target1 hit if low <= target1
  */
+/**
+ * Check exit using deterministic intra-bar path.
+ *
+ * Uses the configured fillModel (conservative | midpoint | aggressive) to
+ * determine whether stop or target was hit first when the bar contains both.
+ *
+ * Special cases handled deterministically:
+ *   - Same-bar stop + target: order determined by fillModel
+ *   - Gap-through stop:  open already past stop → exit at open (worse fill)
+ *   - Gap-through target: open already past target → exit at open (better fill)
+ *
+ * Stop/target priority within the path (long position):
+ *   step 1: scan path until stop OR any target hit
+ *   step 2: if stop first → exit stop_loss at stopLoss
+ *   step 3: if target first → walk targets in order, exit at highest hit
+ */
 export function checkExit(
   pos: OpenPosition,
   candle: Candle,
   barsInTrade: number,
   maxBars: number,
+  fillModel?: BacktestRunConfig['fillModel'],
 ): ExitResult {
   const noExit: ExitResult = {
     exited: false, exitPrice: 0, exitReason: 'signal_expiry',
@@ -97,71 +134,75 @@ export function checkExit(
     target3Hit: pos.target3Hit, stopHit: false,
   };
 
-  if (pos.direction === 'long') {
-    // ── STOP CHECK (highest priority) ─────────────────────
-    if (candle.low <= pos.stopLoss) {
-      return {
-        exited: true,
-        exitPrice: pos.stopLoss, // exit at stop, not at low (limit order)
-        exitReason: 'stop_loss',
-        target1Hit: pos.target1Hit,
-        target2Hit: pos.target2Hit,
-        target3Hit: pos.target3Hit,
-        stopHit: true,
-      };
-    }
+  const assumption = fillModelToAssumption(fillModel);
+  const path = getIntraBarPricePath(candle, assumption);
+  const isLong = pos.direction === 'long';
 
-    // ── TARGET CHECKS (in order) ──────────────────────────
-    let t1 = pos.target1Hit;
-    let t2 = pos.target2Hit;
-    let t3 = pos.target3Hit;
+  // ── Gap-through detection (open already past stop or target) ──
+  if (isLong && candle.open <= pos.stopLoss) {
+    // Long: opened below stop → fill at open (worse than stop)
+    return {
+      exited: true, exitPrice: candle.open, exitReason: 'stop_loss',
+      target1Hit: pos.target1Hit, target2Hit: pos.target2Hit,
+      target3Hit: pos.target3Hit, stopHit: true,
+    };
+  }
+  if (!isLong && candle.open >= pos.stopLoss) {
+    // Short: opened above stop → fill at open (worse than stop)
+    return {
+      exited: true, exitPrice: candle.open, exitReason: 'stop_loss',
+      target1Hit: pos.target1Hit, target2Hit: pos.target2Hit,
+      target3Hit: pos.target3Hit, stopHit: true,
+    };
+  }
 
-    if (!t1 && candle.high >= pos.target1) t1 = true;
-    if (t1 && !t2 && candle.high >= pos.target2) t2 = true;
-    if (t2 && !t3 && candle.high >= pos.target3) t3 = true;
+  // Track running target state
+  let t1 = pos.target1Hit;
+  let t2 = pos.target2Hit;
+  let t3 = pos.target3Hit;
 
-    // Exit on target3 hit
-    if (t3 && !pos.target3Hit) {
-      return { exited: true, exitPrice: pos.target3, exitReason: 'target3', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
+  // ── Walk the intra-bar path looking for stop/target hits ──
+  for (const price of path) {
+    if (isLong) {
+      // Long: stop is below, targets are above
+      if (price <= pos.stopLoss) {
+        return {
+          exited: true, exitPrice: pos.stopLoss, exitReason: 'stop_loss',
+          target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: true,
+        };
+      }
+      if (!t1 && price >= pos.target1) t1 = true;
+      if (t1 && !t2 && price >= pos.target2) t2 = true;
+      if (t2 && !t3 && price >= pos.target3) t3 = true;
+      if (t3 && !pos.target3Hit) {
+        return { exited: true, exitPrice: pos.target3, exitReason: 'target3', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
+      }
+      if (t2 && !pos.target2Hit) {
+        return { exited: true, exitPrice: pos.target2, exitReason: 'target2', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
+      }
+    } else {
+      // Short: stop is above, targets are below
+      if (price >= pos.stopLoss) {
+        return {
+          exited: true, exitPrice: pos.stopLoss, exitReason: 'stop_loss',
+          target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: true,
+        };
+      }
+      if (!t1 && price <= pos.target1) t1 = true;
+      if (t1 && !t2 && price <= pos.target2) t2 = true;
+      if (t2 && !t3 && price <= pos.target3) t3 = true;
+      if (t3 && !pos.target3Hit) {
+        return { exited: true, exitPrice: pos.target3, exitReason: 'target3', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
+      }
+      if (t2 && !pos.target2Hit) {
+        return { exited: true, exitPrice: pos.target2, exitReason: 'target2', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
+      }
     }
-    // Exit on target2 hit (partial logic — in production you'd scale out)
-    if (t2 && !pos.target2Hit) {
-      return { exited: true, exitPrice: pos.target2, exitReason: 'target2', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
-    }
+  }
 
-    // Update target tracking without exit
-    if (t1 !== pos.target1Hit || t2 !== pos.target2Hit) {
-      return { exited: false, exitPrice: 0, exitReason: 'signal_expiry', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
-    }
-  } else {
-    // ── SHORT: STOP CHECK ─────────────────────────────────
-    if (candle.high >= pos.stopLoss) {
-      return {
-        exited: true, exitPrice: pos.stopLoss, exitReason: 'stop_loss',
-        target1Hit: pos.target1Hit, target2Hit: pos.target2Hit,
-        target3Hit: pos.target3Hit, stopHit: true,
-      };
-    }
-
-    // ── SHORT: TARGET CHECKS ──────────────────────────────
-    let t1 = pos.target1Hit;
-    let t2 = pos.target2Hit;
-    let t3 = pos.target3Hit;
-
-    if (!t1 && candle.low <= pos.target1) t1 = true;
-    if (t1 && !t2 && candle.low <= pos.target2) t2 = true;
-    if (t2 && !t3 && candle.low <= pos.target3) t3 = true;
-
-    if (t3 && !pos.target3Hit) {
-      return { exited: true, exitPrice: pos.target3, exitReason: 'target3', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
-    }
-    if (t2 && !pos.target2Hit) {
-      return { exited: true, exitPrice: pos.target2, exitReason: 'target2', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
-    }
-
-    if (t1 !== pos.target1Hit || t2 !== pos.target2Hit) {
-      return { exited: false, exitPrice: 0, exitReason: 'signal_expiry', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
-    }
+  // T1 was hit but no full exit — update tracking only
+  if (t1 !== pos.target1Hit || t2 !== pos.target2Hit) {
+    return { exited: false, exitPrice: 0, exitReason: 'signal_expiry', target1Hit: t1, target2Hit: t2, target3Hit: t3, stopHit: false };
   }
 
   // ── TIME EXPIRY ─────────────────────────────────────────

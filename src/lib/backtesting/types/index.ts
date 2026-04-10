@@ -56,7 +56,7 @@ export interface BacktestRunConfig {
 //  2. BACKTEST RUN RECORD (persisted result)
 // ════════════════════════════════════════════════════════════════
 
-export type BacktestStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type BacktestStatus = 'queued' | 'running' | 'completed' | 'partial_success' | 'failed' | 'cancelled';
 
 export interface BacktestRunRecord {
   runId: string;
@@ -418,7 +418,15 @@ export type AuditAction = 'run_started' | 'run_completed' | 'run_failed'
   | 'signal_generated' | 'signal_expired' | 'signal_filtered'
   | 'entry_triggered' | 'exit_stop' | 'exit_target' | 'exit_expiry'
   | 'position_opened' | 'position_closed'
-  | 'config_validated' | 'data_loaded';
+  | 'config_validated' | 'data_loaded'
+  | 'metrics_computed' | 'calibration_computed' | 'persistence_completed'
+  | 'simulation_completed' | 'outcomes_computed';
+
+export interface RunStatusInfo {
+  status: BacktestStatus;
+  lastSuccessfulStep: string | null;
+  errorMessage: string | null;
+}
 
 export interface BacktestAuditEntry {
   runId: string;
