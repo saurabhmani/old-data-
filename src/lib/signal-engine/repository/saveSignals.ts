@@ -5,6 +5,11 @@
 import { db } from '@/lib/db';
 import type { QuantSignal } from '../types/signalEngine.types';
 
+function toMysqlDateTime(value: string | Date | undefined): string {
+  const d = value ? new Date(value) : new Date();
+  return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
 /**
  * Save signals and return map of symbol → inserted DB ID.
  * This enables downstream saves (breakdowns, explanations) to reference real IDs.
@@ -54,7 +59,7 @@ async function saveOneSignal(s: QuantSignal): Promise<number | null> {
       entryPrice, s.stopLoss, s.targets.target1, s.targets.target2,
       riskReward, s.marketRegime,
       s.status === 'active' ? 'active' : s.status === 'watchlist' ? 'watchlist' : 'active',
-      s.generatedAt,
+      toMysqlDateTime(s.generatedAt),
     ],
   );
 
